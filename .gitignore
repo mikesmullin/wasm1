@@ -1,0 +1,14 @@
+.tokens.yaml
+.env
+
+# Local environment variants
+.env.*
+!.env.example
+
+# Rust / Cargo build artifacts
+/target/
+/guest/target/
+
+# Editor/OS noise
+.DS_Store
+.vscode/
