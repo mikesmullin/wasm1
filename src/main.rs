@@ -4,6 +4,7 @@ use quick_js::Context as JsContext;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 use wasmtime::{Caller, Engine, Linker, Module, Store};
@@ -15,7 +16,7 @@ const GUEST_WASM_PATH: &str = "guest/target/wasm32-unknown-unknown/debug/guest.w
 struct HostState {
     prompt: String,
     final_answer: Option<String>,
-    api_key: Option<String>,
+    api_key: String,
     model: String,
     client: Client,
 }
@@ -204,7 +205,8 @@ fn main() -> Result<()> {
     let state = HostState {
         prompt,
         final_answer: None,
-        api_key: env::var("XAI_API_KEY").ok(),
+        api_key: env::var("XAI_API_KEY")
+            .context("XAI_API_KEY is required (set it in environment or .env)")?,
         model: env::var("XAI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
         client: Client::new(),
     };
@@ -222,11 +224,6 @@ fn main() -> Result<()> {
 }
 
 fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
-    if state.api_key.is_none() {
-        return Ok(mock_decision(req));
-    }
-
-    let api_key = state.api_key.as_ref().expect("checked");
     let tools_json = r#"[
   {
     "type": "function",
@@ -279,7 +276,7 @@ Use js_exec when computation/program execution is useful. No markdown or code fe
     let resp = state
         .client
         .post("https://api.x.ai/v1/chat/completions")
-        .bearer_auth(api_key)
+        .bearer_auth(&state.api_key)
         .json(&body)
         .send()
         .context("request to xAI failed")?
@@ -315,43 +312,6 @@ fn parse_llm_decision(text: &str) -> Result<LlmDecision> {
         .with_context(|| format!("model output not valid decision JSON: {text}"))
 }
 
-fn mock_decision(req: &GuestRequest) -> LlmDecision {
-    let lower = req.prompt.to_lowercase();
-    if req.tool_result.is_none() {
-        if lower.contains("magic 8-ball") {
-            return LlmDecision::ToolCall {
-                tool: "js_exec".to_string(),
-                code: "const answers=[\"It is certain\",\"Ask again later\",\"Outlook good\",\"Very doubtful\"]; const question='Will this PoC work?'; const answer=answers[Math.floor(Math.random()*answers.length)]; console.log('Question:',question); console.log('8-ball:',answer); answer;".to_string(),
-                thought: Some("Need JS execution for randomized 8-ball output".to_string()),
-            };
-        }
-        if lower.contains("17") && lower.contains("23") {
-            return LlmDecision::ToolCall {
-                tool: "js_exec".to_string(),
-                code: "17 * 23".to_string(),
-                thought: Some("Use calculator tool".to_string()),
-            };
-        }
-        if lower.contains("3^5") || lower.contains("in words") {
-            return LlmDecision::ToolCall {
-                tool: "js_exec".to_string(),
-                code: "(3**5 + 7) * 4".to_string(),
-                thought: Some("Compute expression precisely".to_string()),
-            };
-        }
-        return LlmDecision::Final {
-            answer: "Tokenless mock mode: set XAI_API_KEY for live Grok responses.".to_string(),
-            thought: Some("No API key available".to_string()),
-        };
-    }
-
-    let result = req.tool_result.clone().unwrap_or_default();
-    LlmDecision::Final {
-        answer: format!("Tool execution complete. Result summary: {result}"),
-        thought: Some("Returning final response after tool use".to_string()),
-    }
-}
-
 fn execute_js(code: &str) -> JsExecResult {
     let context = match JsContext::new() {
         Ok(v) => v,
@@ -363,6 +323,16 @@ fn execute_js(code: &str) -> JsExecResult {
             }
         }
     };
+
+    if let Err(err) = context.add_callback("__host_read_file", |path: String| -> Result<String, String> {
+        fs::read_to_string(&path).map_err(|e| e.to_string())
+    }) {
+        return JsExecResult {
+            stdout: String::new(),
+            result: String::new(),
+            error: Some(format!("failed to install fs callback: {err}")),
+        };
+    }
 
     let code_literal = match serde_json::to_string(code) {
         Ok(v) => v,
@@ -379,6 +349,14 @@ fn execute_js(code: &str) -> JsExecResult {
         "(function() {{
             const __logs = [];
             const console = {{ log: (...args) => __logs.push(args.map(x => String(x)).join(' ')) }};
+            const fs = {{
+                readFile: (path, _encoding) => __host_read_file(String(path)),
+                readFileSync: (path, _encoding) => __host_read_file(String(path)),
+            }};
+            const require = (name) => {{
+                if (name === 'fs') return fs;
+                throw new Error('Module not found: ' + String(name));
+            }};
             try {{
                 const __value = eval({code_literal});
                 return JSON.stringify({{ stdout: __logs.join('\\n'), result: String(__value), error: null }});
