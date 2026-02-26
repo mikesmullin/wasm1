@@ -6,8 +6,8 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0"
 dotenvy = "0.15"
-quick-js = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-wasmtime = "14.0"
+wasmtime = { version = "14.0", features = ["cranelift", "cache"] }
+wasmtime-wasi = "14.0"

@@ -1,3 +1,4 @@
+use boa_engine::{Context as BoaContext, Source};
 use serde::{Deserialize, Serialize};
 
 const BUF_SIZE: usize = 128 * 1024;
@@ -34,7 +35,6 @@ unsafe extern "C" {
     fn host_log(ptr: i32, len: i32);
     fn emit_final(ptr: i32, len: i32);
     fn grok_chat(req_ptr: i32, req_len: i32, out_ptr: i32, out_cap: i32) -> i32;
-    fn js_exec(code_ptr: i32, code_len: i32, out_ptr: i32, out_cap: i32) -> i32;
 }
 
 #[no_mangle]
@@ -82,7 +82,7 @@ fn run_inner() -> Result<(), String> {
                 if tool != "js_exec" {
                     return Err(format!("unsupported tool: {tool}"));
                 }
-                let result = call_host_text_js(&code)?;
+                let result = run_js_in_boa(&code);
                 log_line(&format!("Tool result: {result}"));
                 tool_result = Some(result);
             }
@@ -128,26 +128,64 @@ fn call_host_text_grok(input: &str) -> Result<String, String> {
     String::from_utf8(out[..written as usize].to_vec()).map_err(|e| e.to_string())
 }
 
-fn call_host_text_js(code: &str) -> Result<String, String> {
-    let mut out = vec![0u8; BUF_SIZE];
-    let written = unsafe {
-        js_exec(
-            code.as_ptr() as i32,
-            code.len() as i32,
-            out.as_mut_ptr() as i32,
-            out.len() as i32,
-        )
-    };
-    if written < 0 {
-        return Err(format!("js_exec failed with {written}"));
-    }
-    String::from_utf8(out[..written as usize].to_vec()).map_err(|e| e.to_string())
-}
-
 fn log_line(line: &str) {
     unsafe { host_log(line.as_ptr() as i32, line.len() as i32) }
 }
 
 fn emit_final_line(line: &str) {
     unsafe { emit_final(line.as_ptr() as i32, line.len() as i32) }
+}
+
+#[derive(Serialize)]
+struct JsResult {
+    stdout: String,
+    result: String,
+    error: Option<String>,
+}
+
+fn run_js_in_boa(code: &str) -> String {
+    let mut ctx = BoaContext::default();
+
+    let setup = r#"
+        var __logs = [];
+        var console = { log: function() {
+            var parts = [];
+            for (var i = 0; i < arguments.length; i++) parts.push(String(arguments[i]));
+            __logs.push(parts.join(' '));
+        }};
+    "#;
+
+    if let Err(e) = ctx.eval(Source::from_bytes(setup)) {
+        let r = JsResult {
+            stdout: String::new(),
+            result: String::new(),
+            error: Some(format!("console setup failed: {e:?}")),
+        };
+        return serde_json::to_string(&r).unwrap_or_default();
+    }
+
+    let user_result = ctx.eval(Source::from_bytes(code));
+
+    let stdout = match ctx.eval(Source::from_bytes("__logs.join('\\n')")) {
+        Ok(v) => v.to_string(&mut ctx)
+            .map(|s| s.to_std_string_escaped())
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    };
+
+    let r = match user_result {
+        Ok(val) => {
+            let result = val.to_string(&mut ctx)
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_else(|_| "undefined".to_string());
+            JsResult { stdout, result, error: None }
+        }
+        Err(e) => JsResult {
+            stdout,
+            result: String::new(),
+            error: Some(format!("{e:?}")),
+        },
+    };
+
+    serde_json::to_string(&r).unwrap_or_default()
 }
