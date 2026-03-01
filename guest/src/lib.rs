@@ -14,12 +14,19 @@ use boa_engine::{
 use serde::{Deserialize, Serialize};
 
 const BUF_SIZE: usize = 128 * 1024;
-const MAX_STEPS: u32 = 6;
+
+#[derive(Debug, Serialize)]
+struct HistoryEntry {
+    tool_call_id: String,
+    tool_name: String,
+    assistant_msg_json: String,
+    result_json: String,
+}
 
 #[derive(Debug, Serialize)]
 struct GuestRequest<'a> {
     prompt: &'a str,
-    tool_result: Option<&'a str>,
+    history: &'a [HistoryEntry],
     step: u32,
 }
 
@@ -29,8 +36,12 @@ enum LlmDecision {
     #[serde(rename = "tool_call")]
     ToolCall {
         tool: String,
-        code: String,
-        thought: Option<String>,
+        tool_call_id: String,
+        assistant_msg_json: String,
+        #[serde(default)]
+        code: Option<String>,
+        #[serde(default)]
+        args: Option<serde_json::Value>,
     },
     #[serde(rename = "final")]
     Final {
@@ -44,6 +55,7 @@ enum LlmDecision {
 #[link(wasm_import_module = "host")]
 unsafe extern "C" {
     fn get_prompt(out_ptr: i32, out_cap: i32) -> i32;
+    fn get_max_steps() -> i32;
     fn host_log(ptr: i32, len: i32);
     fn emit_final(ptr: i32, len: i32);
     fn grok_chat(req_ptr: i32, req_len: i32, out_ptr: i32, out_cap: i32) -> i32;
@@ -59,6 +71,12 @@ unsafe extern "C" {
     ) -> i32;
     fn shell_stdin(pid: i32, keys_ptr: i32, keys_len: i32) -> i32;
     fn shell_kill(pid: i32, sig_ptr: i32, sig_len: i32) -> i32;
+    // Named tool dispatch — returns JSON {"result":"..."} or {"error":"..."}
+    fn tool_dispatch(
+        name_ptr: i32, name_len: i32,
+        args_ptr: i32, args_len: i32,
+        out_ptr: i32, out_cap: i32,
+    ) -> i32;
 }
 
 // ── Safe VFS wrappers called from Boa native functions ────────────────────────
@@ -525,12 +543,19 @@ fn run_inner() -> Result<(), String> {
     let prompt = read_prompt()?;
     log_line(&format!("Received prompt: {prompt}"));
 
-    let mut tool_result: Option<String> = None;
+    let mut history: Vec<HistoryEntry> = Vec::new();
+    // max_steps: -1 = unlimited (default); >=0 = hard cap from template spec.max_steps
+    let max_steps: i32 = unsafe { get_max_steps() };
+    let mut step: u32 = 0;
 
-    for step in 0..MAX_STEPS {
+    loop {
+        if max_steps >= 0 && step >= max_steps as u32 {
+            emit_final_line("Stopped: reached max_steps limit.");
+            return Ok(());
+        }
         let req = GuestRequest {
             prompt: &prompt,
-            tool_result: tool_result.as_deref(),
+            history: &history,
             step,
         };
         let req_json = serde_json::to_string(&req).map_err(|e| e.to_string())?;
@@ -543,19 +568,35 @@ fn run_inner() -> Result<(), String> {
         match decision {
             LlmDecision::ToolCall {
                 tool,
+                tool_call_id,
+                assistant_msg_json,
                 code,
-                thought,
+                args,
             } => {
                 log_line(&format!("Tool call requested: {tool}"));
-                if let Some(t) = thought {
-                    log_line(&format!("Model thought: {t}"));
-                }
-                if tool != "js_exec" {
-                    return Err(format!("unsupported tool: {tool}"));
-                }
-                let result = run_js_in_boa(&code);
+                let result = if tool == "js_exec" {
+                    let src = code
+                        .or_else(|| {
+                            args.as_ref()
+                                .and_then(|a| a["code"].as_str())
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default();
+                    run_js_in_boa(&src)
+                } else {
+                    let args_str = args
+                        .as_ref()
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "{}".to_string());
+                    call_tool_dispatch(&tool, &args_str)
+                };
                 log_line(&format!("Tool result: {result}"));
-                tool_result = Some(result);
+                history.push(HistoryEntry {
+                    tool_call_id,
+                    tool_name: tool,
+                    assistant_msg_json,
+                    result_json: result,
+                });
             }
             LlmDecision::Final { answer, thought } => {
                 if let Some(t) = thought {
@@ -568,10 +609,8 @@ fn run_inner() -> Result<(), String> {
                 return Err(format!("llm error: {message}"));
             }
         }
+        step += 1;
     }
-
-    emit_final_line("Stopped after max steps without final answer.");
-    Ok(())
 }
 
 fn read_prompt() -> Result<String, String> {
@@ -597,6 +636,54 @@ fn call_host_text_grok(input: &str) -> Result<String, String> {
         return Err(format!("grok_chat failed with {written}"));
     }
     String::from_utf8(out[..written as usize].to_vec()).map_err(|e| e.to_string())
+}
+
+fn call_tool_dispatch(name: &str, args_json: &str) -> String {
+    let mut out = vec![0u8; BUF_SIZE];
+    let written = unsafe {
+        tool_dispatch(
+            name.as_ptr() as i32,
+            name.len() as i32,
+            args_json.as_ptr() as i32,
+            args_json.len() as i32,
+            out.as_mut_ptr() as i32,
+            out.len() as i32,
+        )
+    };
+    if written < 0 {
+        let err_msg = format!("tool_dispatch returned {written}");
+        serde_json::to_string(&JsExecResult {
+            stdout: String::new(),
+            result: String::new(),
+            error: Some(err_msg),
+        })
+        .unwrap_or_else(|_| r#"{"stdout":"","result":"","error":"dispatch failed"}"#.to_string())
+    } else {
+        let raw = String::from_utf8_lossy(&out[..written as usize]).into_owned();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        if let Some(r) = parsed["result"].as_str() {
+            serde_json::to_string(&JsExecResult {
+                stdout: String::new(),
+                result: r.to_string(),
+                error: None,
+            })
+            .unwrap_or_else(|_| r#"{"stdout":"","result":"","error":null}"#.to_string())
+        } else if let Some(e) = parsed["error"].as_str() {
+            serde_json::to_string(&JsExecResult {
+                stdout: String::new(),
+                result: String::new(),
+                error: Some(e.to_string()),
+            })
+            .unwrap_or_else(|_| r#"{"stdout":"","result":"","error":"dispatch error"}"#.to_string())
+        } else {
+            serde_json::to_string(&JsExecResult {
+                stdout: String::new(),
+                result: raw,
+                error: None,
+            })
+            .unwrap_or_default()
+        }
+    }
 }
 
 fn log_line(line: &str) {

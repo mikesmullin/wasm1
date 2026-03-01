@@ -3,22 +3,25 @@ kind: Agent
 metadata:
   description: Solo task runner — general-purpose shell agent
   model: xai:grok-4-fast-reasoning
+  # Fallback context window (tokens) for unknown models not in the built-in table.
+  # Known xAI models are detected automatically; set this only for custom/unlisted models.
+  # context_window: 131072
+
+  tools:
+    - js_exec
+    # - fs__file__view
+    # - fs__file__create
+    # - fs__file__edit
+    # - fs__directory__list
 
   # wasm1 extension — shell execution policy
   shell:
+    # max_steps: 10
     # timeout_secs: 5
     # Ordered list of regexp patterns. First match wins.
     # Matched against the full command string: "cmd arg1 arg2 ..."
     allow:
-      - '^echo\b'
-      - '^curl\b'
-      - '^sleep\b'
-      - '^ls\b'
-      - '^cat\s+[^/]'           # cat only relative paths
-      - '^pwd\b'
       - '^date\b'
-      - '^git\s+(status|log|diff|show)\b'
-      - '^cargo\s+(build|test|check)\b'
     # If no allow entry matches, the command is rejected.
 
 spec:
