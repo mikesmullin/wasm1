@@ -43,6 +43,9 @@ struct TemplateMetadata {
     context_window: Option<u64>,
     labels: Option<Vec<String>>,
     hooks: Option<Vec<HookDef>>,
+    max_steps: Option<u32>,
+    validate: Option<String>,
+    max_validation_fails: Option<u32>,
     shell: Option<ShellConfig>,
     /// Explicit tool allowlist for the session. Absent = all tools.
     tools: Option<Vec<String>>,
@@ -64,6 +67,7 @@ struct TemplateSpec {
 struct HookDef {
     name: String,
     on: String,
+    enabled: Option<bool>,
     #[serde(default)]
     when: HashMap<String, serde_yaml::Value>,
     #[serde(default)]
@@ -156,6 +160,8 @@ struct SessionMetadata {
     created: String,
     last_pid: u32,
     tools: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_steps: Option<u32>,
     labels: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
@@ -176,8 +182,6 @@ struct SessionTransition {
 struct SessionSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     system_prompt: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_steps: Option<u32>,
     messages: Vec<serde_json::Value>,
 }
 
@@ -219,6 +223,10 @@ struct HostState {
     system_prompt: Option<String>,
     /// Maximum agent loop steps; None = unlimited.
     max_steps: Option<u32>,
+    /// Optional JS validation function from template metadata.validate.
+    validate_fn: Option<String>,
+    /// Maximum validation retries before failing the run.
+    max_validation_fails: Option<u32>,
     /// Tool names available to the LLM (controls tools_json).
     #[allow(dead_code)]
     enabled_tools: Vec<String>,
@@ -254,6 +262,8 @@ struct HistoryEntry {
 struct GuestRequest {
     prompt: String,
     history: Vec<HistoryEntry>,
+    #[serde(default)]
+    validation_feedback: Vec<String>,
     step: u32,
 }
 
@@ -297,24 +307,18 @@ fn resolve_template(name: &str) -> Result<PathBuf> {
     } else {
         format!("{name}.yaml")
     };
-    let home = env::var("HOME").unwrap_or_default();
-    let candidates = [
-        PathBuf::from(".agent/templates").join(&basename),
-        PathBuf::from(&home)
-            .join(".config/daemon/agent/templates")
-            .join(&basename),
-    ];
+    let candidates = [PathBuf::from(".agent/templates").join(&basename)];
     for candidate in &candidates {
         if candidate.exists() {
             return Ok(candidate.clone());
         }
     }
     Err(anyhow!(
-        "template '{name}' not found in .agent/templates/ or ~/.config/daemon/agent/templates/"
+        "template '{name}' not found in .agent/templates/"
     ))
 }
 
-fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>, Option<u32>, Vec<String>, Option<u64>, Vec<HookDef>, Option<String>, Vec<String>)> {
+fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>, Option<u32>, Option<String>, Option<u32>, Vec<String>, Option<u64>, Vec<HookDef>, Option<String>, Vec<String>)> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read template: {}", path.display()))?;
     let template: Template = serde_yaml::from_str(&content)
@@ -342,8 +346,29 @@ fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>
         .iter()
         .map(|pat| Regex::new(pat).with_context(|| format!("invalid regex in template: {pat}")))
         .collect::<Result<Vec<_>>>()?;
-    let system_prompt = template.spec.as_ref().and_then(|s| s.system_prompt.clone());
-    let max_steps = template.spec.as_ref().and_then(|s| s.max_steps);
+    let mut system_prompt = template.spec.as_ref().and_then(|s| s.system_prompt.clone());
+    let max_steps = template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.max_steps)
+        .or_else(|| template.spec.as_ref().and_then(|s| s.max_steps));
+    let validate_fn = template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.validate.clone())
+        .filter(|s| !s.trim().is_empty());
+    let max_validation_fails = template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.max_validation_fails);
+    if let Some(validate_code) = validate_fn.as_deref() {
+        let validation_prompt = format!(
+            "\n\nYour reply must cause the following function to return truthy:\n```js\n{validate_code}```"
+        );
+        let mut base = system_prompt.unwrap_or_default();
+        base.push_str(&validation_prompt);
+        system_prompt = Some(base);
+    }
     // tools: absent → all built-in tools; explicit list → only those
     let template_context_window = template.metadata.as_ref().and_then(|m| m.context_window);
     let hooks = template
@@ -360,21 +385,27 @@ fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>
         .metadata
         .as_ref()
         .and_then(|m| m.description.clone());
-    let tools = template.metadata
-        .and_then(|m| m.tools)
+    let tools = template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.tools.clone())
         .unwrap_or_else(all_tool_names);
     println!(
-        "[HOST] Template loaded: {} shell allow-list entries, timeout: {}, system_prompt: {}, max_steps: {}, tools: [{}], hooks: {}, labels: {}, context_window: {}",
+        "[HOST] Template loaded: {} shell allow-list entries, timeout: {}, system_prompt: {}, max_steps: {}, validate: {}, max_validation_fails: {}, tools: [{}], hooks: {}, labels: {}, context_window: {}",
         regexes.len(),
         timeout.map(|t| format!("{t}s")).unwrap_or_else(|| "indefinite".into()),
         system_prompt.as_deref().map(|s| format!("{} chars", s.len())).unwrap_or_else(|| "none".into()),
         max_steps.map(|n| n.to_string()).unwrap_or_else(|| "indefinite".into()),
+        if validate_fn.is_some() { "yes" } else { "no" },
+        max_validation_fails
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "indefinite".into()),
         tools.join(", "),
         hooks.len(),
         labels.len(),
         template_context_window.map(|n| format!("{n}")).unwrap_or_else(|| "unset".into()),
     );
-    Ok((regexes, timeout, system_prompt, max_steps, tools, template_context_window, hooks, description, labels))
+    Ok((regexes, timeout, system_prompt, max_steps, validate_fn, max_validation_fails, tools, template_context_window, hooks, description, labels))
 }
 
 /// Query the xAI models endpoint to discover the context window for `model`.
@@ -414,7 +445,25 @@ fn main() -> Result<()> {
     let all_args: Vec<String> = env::args().skip(1).collect();
     if all_args.first().map(String::as_str) == Some("cron") {
         let mode = all_args.get(1).map(String::as_str).unwrap_or("once");
-        return run_cron(mode);
+        let mut cron_template: Option<String> = None;
+        let mut idx = 2usize;
+        while idx < all_args.len() {
+            match all_args[idx].as_str() {
+                "-t" | "--template" => {
+                    if idx + 1 >= all_args.len() {
+                        return Err(anyhow!("usage: cargo run -- cron [once|watch] [-t <template>]"));
+                    }
+                    cron_template = Some(all_args[idx + 1].clone());
+                    idx += 2;
+                }
+                other => {
+                    return Err(anyhow!(
+                        "unknown cron arg: {other}. usage: cargo run -- cron [once|watch] [-t <template>]"
+                    ));
+                }
+            }
+        }
+        return run_cron(mode, cron_template.as_deref());
     }
     if all_args.first().map(String::as_str) == Some("clean") {
         return run_clean();
@@ -434,12 +483,12 @@ fn main() -> Result<()> {
         prompt.ok_or_else(|| anyhow!("usage: cargo run -- [clean|cron <once|watch>|-t <template>] \"<prompt>\""))?;
 
     // Load template allow-list if -t was supplied
-    let (shell_allow, shell_timeout, system_prompt, max_steps, enabled_tools, template_context_window, template_hooks, template_description, template_labels) = if let Some(ref name) = template_name {
+    let (shell_allow, shell_timeout, system_prompt, max_steps, validate_fn, max_validation_fails, enabled_tools, template_context_window, template_hooks, template_description, template_labels) = if let Some(ref name) = template_name {
         let path = resolve_template(name)?;
         println!("[HOST] Using template: {}", path.display());
         load_template(&path)?
     } else {
-        (Vec::new(), SHELL_TIMEOUT_DEFAULT, None, None, all_tool_names(), None, Vec::new(), None, Vec::new())
+        (Vec::new(), SHELL_TIMEOUT_DEFAULT, None, None, None, None, all_tool_names(), None, Vec::new(), None, Vec::new())
     };
     let effective_hooks = merge_hooks(load_global_hooks()?, template_hooks);
     println!("[HOST] Hooks loaded: {}", effective_hooks.len());
@@ -485,6 +534,32 @@ fn main() -> Result<()> {
         "get_max_steps",
         |caller: Caller<'_, HostState>| -> i32 {
             caller.data().max_steps.map(|n| n as i32).unwrap_or(-1)
+        },
+    )?;
+
+    linker.func_wrap(
+        "host",
+        "get_validate",
+        |mut caller: Caller<'_, HostState>, out_ptr: i32, out_cap: i32| -> i32 {
+            let validate_fn = caller
+                .data()
+                .validate_fn
+                .as_deref()
+                .unwrap_or("")
+                .to_string();
+            write_memory(&mut caller, out_ptr, out_cap, &validate_fn)
+        },
+    )?;
+
+    linker.func_wrap(
+        "host",
+        "get_max_validation_fails",
+        |caller: Caller<'_, HostState>| -> i32 {
+            caller
+                .data()
+                .max_validation_fails
+                .map(|n| n as i32)
+                .unwrap_or(-1)
         },
     )?;
 
@@ -1258,6 +1333,8 @@ fn main() -> Result<()> {
         running_processes: HashMap::new(),
         system_prompt,
         max_steps,
+        validate_fn,
+        max_validation_fails,
         enabled_tools,
         context_window,
         session_id,
@@ -1359,10 +1436,20 @@ fn now_stamp() -> String {
     now_millis().to_string()
 }
 
-fn run_cron(mode: &str) -> Result<()> {
+fn run_cron(mode: &str, template_name: Option<&str>) -> Result<()> {
     let workspace_root = env::current_dir().context("failed to get current directory")?;
     let session_id = format!("cron-{}-{}", std::process::id(), now_millis());
-    let hooks = merge_hooks(load_global_hooks()?, Vec::new());
+    let global_hooks = load_global_hooks()?;
+    let template_hooks = if let Some(name) = template_name {
+        let path = resolve_template(name)?;
+        read_hooks_from_template_file(&path)?
+    } else {
+        load_all_template_hooks()?
+    };
+    let hooks = merge_hooks(global_hooks, template_hooks)
+        .into_iter()
+        .filter(|h| h.on == "cron_tick" && h.enabled.unwrap_or(true))
+        .collect::<Vec<_>>();
     match mode {
         "once" => {
             let _ = run_hooks_impl(
@@ -1394,8 +1481,56 @@ fn run_cron(mode: &str) -> Result<()> {
                 std::thread::sleep(Duration::from_secs(60));
             }
         }
-        _ => Err(anyhow!("usage: wasm1 cron [once|watch]")),
+        _ => Err(anyhow!("usage: wasm1 cron [once|watch] [-t <template>]")),
     }
+}
+
+fn read_hooks_from_template_file(path: &Path) -> Result<Vec<HookDef>> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read template: {}", path.display()))?;
+    let root: serde_yaml::Value = serde_yaml::from_str(&content)
+        .with_context(|| format!("failed to parse template YAML: {}", path.display()))?;
+    let hooks_value = root
+        .get("metadata")
+        .and_then(|m| m.get("hooks"))
+        .cloned()
+        .unwrap_or_else(|| serde_yaml::Value::Sequence(Vec::new()));
+
+    if matches!(hooks_value, serde_yaml::Value::Null) {
+        return Ok(Vec::new());
+    }
+
+    let hooks: Vec<HookDef> = serde_yaml::from_value(hooks_value)
+        .with_context(|| format!("failed to parse metadata.hooks in template: {}", path.display()))?;
+    Ok(hooks)
+}
+
+fn load_all_template_hooks() -> Result<Vec<HookDef>> {
+    let mut hooks = Vec::new();
+    let dirs = vec![PathBuf::from(".agent/templates")];
+    for dir in dirs {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(&dir)
+            .with_context(|| format!("failed to read template dir: {}", dir.display()))?
+        {
+            let entry = match entry {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if ext != "yaml" && ext != "yml" {
+                continue;
+            }
+            match read_hooks_from_template_file(&path) {
+                Ok(mut hs) => hooks.append(&mut hs),
+                Err(e) => eprintln!("[HOST] skipping template hooks from {}: {e:#}", path.display()),
+            }
+        }
+    }
+    Ok(hooks)
 }
 
 fn read_hook_dir(dir: &Path) -> Result<Vec<HookDef>> {
@@ -1424,9 +1559,7 @@ fn read_hook_dir(dir: &Path) -> Result<Vec<HookDef>> {
 
 fn load_global_hooks() -> Result<Vec<HookDef>> {
     let repo_hooks = read_hook_dir(Path::new(".agent/hooks"))?;
-    let home = env::var("HOME").unwrap_or_default();
-    let user_hooks = read_hook_dir(&PathBuf::from(home).join(".config/daemon/agent/hooks"))?;
-    Ok(merge_hooks(repo_hooks, user_hooks))
+    Ok(repo_hooks)
 }
 
 fn merge_hooks(low: Vec<HookDef>, high: Vec<HookDef>) -> Vec<HookDef> {
@@ -1475,7 +1608,10 @@ fn run_hooks_impl(
     });
     merge_json_object(&mut base, payload);
 
-    for hook in hooks.iter().filter(|h| h.on == event) {
+    for hook in hooks
+        .iter()
+        .filter(|h| h.on == event && h.enabled.unwrap_or(true))
+    {
         if !hook_matches(hook, &base) {
             continue;
         }
@@ -1844,6 +1980,7 @@ fn write_session_snapshot(
             created: state.session_created.clone(),
             last_pid: std::process::id(),
             tools: state.enabled_tools.clone(),
+            max_steps: state.max_steps,
             labels: state.template_labels.clone(),
             description: state.template_description.clone(),
             last_transition: Some(SessionTransition {
@@ -1855,7 +1992,6 @@ fn write_session_snapshot(
         },
         spec: SessionSpec {
             system_prompt: state.system_prompt.clone(),
-            max_steps: state.max_steps,
             messages: build_session_messages(req, decision),
         },
     };
@@ -2564,6 +2700,12 @@ fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
             "content": summary,
         }));
     }
+    for feedback in &req.validation_feedback {
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": feedback,
+        }));
+    }
 
     let body = serde_json::json!({
         "model": state.model,
@@ -2573,13 +2715,46 @@ fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
         "tool_choice": "auto",
     });
 
-    let resp = state
-        .client
-        .post("https://api.x.ai/v1/chat/completions")
-        .bearer_auth(&state.api_key)
-        .json(&body)
-        .send()
-        .context("request to xAI failed")?;
+    let mut last_timeout_err: Option<reqwest::Error> = None;
+    let mut resp_opt = None;
+    for attempt in 1..=3 {
+        match state
+            .client
+            .post("https://api.x.ai/v1/chat/completions")
+            .bearer_auth(&state.api_key)
+            .json(&body)
+            .send()
+        {
+            Ok(resp) => {
+                resp_opt = Some(resp);
+                break;
+            }
+            Err(err) if err.is_timeout() && attempt < 3 => {
+                let backoff_ms = 500_u64 * (1_u64 << (attempt - 1));
+                eprintln!(
+                    "[HOST] xAI request timed out (attempt {attempt}/3); retrying in {backoff_ms}ms"
+                );
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+                last_timeout_err = Some(err);
+            }
+            Err(err) if err.is_timeout() => {
+                last_timeout_err = Some(err);
+                break;
+            }
+            Err(err) => {
+                return Err(anyhow!(err).context("request to xAI failed"));
+            }
+        }
+    }
+    let resp = match resp_opt {
+        Some(v) => v,
+        None => {
+            let err = last_timeout_err
+                .map(anyhow::Error::new)
+                .unwrap_or_else(|| anyhow!("request timed out"));
+            return Err(err.context("request to xAI failed after 3 timeout retries"));
+        }
+    };
 
     let status = resp.status();
     let payload: serde_json::Value = resp.json().context("failed to parse xAI response JSON")?;

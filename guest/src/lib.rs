@@ -27,6 +27,7 @@ struct HistoryEntry {
 struct GuestRequest<'a> {
     prompt: &'a str,
     history: &'a [HistoryEntry],
+    validation_feedback: &'a [String],
     step: u32,
 }
 
@@ -56,6 +57,8 @@ enum LlmDecision {
 unsafe extern "C" {
     fn get_prompt(out_ptr: i32, out_cap: i32) -> i32;
     fn get_max_steps() -> i32;
+    fn get_validate(out_ptr: i32, out_cap: i32) -> i32;
+    fn get_max_validation_fails() -> i32;
     fn host_log(ptr: i32, len: i32);
     fn emit_final(ptr: i32, len: i32);
     fn grok_chat(req_ptr: i32, req_len: i32, out_ptr: i32, out_cap: i32) -> i32;
@@ -544,6 +547,10 @@ fn run_inner() -> Result<(), String> {
     log_line(&format!("Received prompt: {prompt}"));
 
     let mut history: Vec<HistoryEntry> = Vec::new();
+    let mut validation_feedback: Vec<String> = Vec::new();
+    let mut validation_fail_count: u32 = 0;
+    let validate_fn = read_validate()?;
+    let max_validation_fails = unsafe { get_max_validation_fails() };
     // max_steps: -1 = unlimited (default); >=0 = hard cap from template spec.max_steps
     let max_steps: i32 = unsafe { get_max_steps() };
     let mut step: u32 = 0;
@@ -556,6 +563,7 @@ fn run_inner() -> Result<(), String> {
         let req = GuestRequest {
             prompt: &prompt,
             history: &history,
+            validation_feedback: &validation_feedback,
             step,
         };
         let req_json = serde_json::to_string(&req).map_err(|e| e.to_string())?;
@@ -602,8 +610,62 @@ fn run_inner() -> Result<(), String> {
                 if let Some(t) = thought {
                     log_line(&format!("Model thought: {t}"));
                 }
-                emit_final_line(&answer);
-                return Ok(());
+                if !validate_fn.trim().is_empty() {
+                    match evaluate_validate(&validate_fn, &answer) {
+                        Ok((true, _)) => {
+                            emit_final_line(&answer);
+                            return Ok(());
+                        }
+                        Ok((false, result_text)) => {
+                            validation_fail_count += 1;
+                            log_line(&format!(
+                                "Validation failed ({}/{})",
+                                validation_fail_count,
+                                if max_validation_fails >= 0 {
+                                    max_validation_fails.to_string()
+                                } else {
+                                    "∞".to_string()
+                                }
+                            ));
+                            if max_validation_fails >= 0
+                                && validation_fail_count >= max_validation_fails as u32
+                            {
+                                let msg = format!(
+                                    "No answer could be returned; the LLM failed to construct an answer that could pass validation in ({}) attempts.",
+                                    max_validation_fails
+                                );
+                                emit_final_line(&msg);
+                                return Ok(());
+                            }
+                            let validation_msg = format!(
+                                "Your reply failed validation because the validation function returned: {}. Please review the javascript validation function code provided, and adapt your reply to conform strictly.",
+                                result_text
+                            );
+                            validation_feedback.push(validation_msg);
+                        }
+                        Err(err) => {
+                            validation_fail_count += 1;
+                            if max_validation_fails >= 0
+                                && validation_fail_count >= max_validation_fails as u32
+                            {
+                                let msg = format!(
+                                    "No answer could be returned; the LLM failed to construct an answer that could pass validation in ({}) attempts.",
+                                    max_validation_fails
+                                );
+                                emit_final_line(&msg);
+                                return Ok(());
+                            }
+                            let validation_msg = format!(
+                                "Your reply failed validation because the validation function returned: \"Validation error: {}\". Please review the javascript validation function code provided, and adapt your reply to conform strictly.",
+                                err
+                            );
+                            validation_feedback.push(validation_msg);
+                        }
+                    }
+                } else {
+                    emit_final_line(&answer);
+                    return Ok(());
+                }
             }
             LlmDecision::Error { message } => {
                 return Err(format!("llm error: {message}"));
@@ -611,6 +673,33 @@ fn run_inner() -> Result<(), String> {
         }
         step += 1;
     }
+}
+
+fn read_validate() -> Result<String, String> {
+    let mut out = vec![0u8; BUF_SIZE];
+    let written = unsafe { get_validate(out.as_mut_ptr() as i32, out.len() as i32) };
+    if written < 0 {
+        return Err(format!("get_validate failed with {written}"));
+    }
+    String::from_utf8(out[..written as usize].to_vec()).map_err(|e| e.to_string())
+}
+
+fn evaluate_validate(validate_fn: &str, reply: &str) -> Result<(bool, String), String> {
+    let mut ctx = BoaContext::default();
+    let validate_src = serde_json::to_string(validate_fn).map_err(|e| e.to_string())?;
+    let reply_src = serde_json::to_string(reply).map_err(|e| e.to_string())?;
+    let script = format!(
+        "(function(){{ const __fn = new Function('reply', {validate_src}); return __fn({reply_src}); }})()"
+    );
+    let value = ctx
+        .eval(Source::from_bytes(script.as_bytes()))
+        .map_err(|e| format!("{e}"))?;
+    let passed = value.to_boolean();
+    let rendered = value
+        .to_string(&mut ctx)
+        .map(|s| s.to_std_string_escaped())
+        .unwrap_or_else(|_| "false".to_string());
+    Ok((passed, rendered))
 }
 
 fn read_prompt() -> Result<String, String> {

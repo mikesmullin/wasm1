@@ -34,6 +34,8 @@ spec:
 | `context_window` | number | no | Context window size in tokens. Known xAI models are resolved automatically from a built-in table; set this only for unlisted or custom models. Used to display `[CTX]` usage percentages. |
 | `labels` | string[] | no | Optional tags for discovery and filtering. |
 | `hooks` | array | no | Template-local hooks merged with repo/user hooks. See [HOOKS.md](HOOKS.md). |
+| `validate` | string | no | JavaScript validation function body run against the final assistant reply (`reply` arg). Must return truthy to accept. |
+| `max_validation_fails` | number | no | Maximum validation retries before failing. Absent = unlimited retries (still bounded by `max_steps`). |
 | `tools` | array | no | Tool allowlist for the session. Absent = all tools. |
 | `shell` | object | no | Shell execution policy. |
 
@@ -50,6 +52,39 @@ spec:
 |---|---|---:|---|
 | `system_prompt` | string | no | EJS-rendered system message. See [EJS in system_prompt](#ejs-in-system_prompt) below. |
 | `max_steps` | number | no | Maximum tool-call iterations. Absent = unlimited. |
+
+---
+
+## Final output validation (`metadata.validate`)
+
+When `metadata.validate` is set, wasm1 enforces final-output shape before finishing the run.
+
+- The validator is evaluated as `new Function('reply', validateCode)(reply)`.
+- `reply` is the assistant's final text (`finish_reason: stop`).
+- Truthy return value passes validation.
+- Falsy return value (or validator exception) injects a correction user message and retries.
+- Retry stops when validation passes, `metadata.max_validation_fails` is reached, or `max_steps` is reached.
+
+Correction prompt injected on failure:
+
+```text
+Your reply failed validation because the validation function returned: <result>. Please review the javascript validation function code provided, and adapt your reply to conform strictly.
+```
+
+The validator source is also appended to `spec.system_prompt` so the model can see the exact rule.
+
+Example:
+
+```yaml
+metadata:
+  validate: |
+    const out = JSON.parse(reply);
+    if (!out || typeof out !== 'object') return false;
+    if (!['noop', 'notified', 'failed'].includes(out.status)) return false;
+    if (typeof out.message !== 'string') return false;
+    return out;
+  max_validation_fails: 3
+```
 
 ---
 
@@ -242,7 +277,7 @@ All wasm1 runtime state lives under `.agent/` in the workspace root (note the le
 .agent/
   templates/          ← agent template YAML files (*.yaml)
   hooks/              ← repo-level hook YAML files (*.yaml)
-  sessions/           ← session YAML snapshots (<session_id>.yml)
+  sessions/           ← session YAML snapshots (<session_id>.yaml)
   fs/                 ← per-session virtual filesystems (<session_id>.tcow)
   msgq/
     pending/          ← unclaimed msgq messages (*.md)
@@ -252,12 +287,7 @@ All wasm1 runtime state lives under `.agent/` in the workspace root (note the le
   snippets/           ← shared prompt fragments for EJS includes
 ```
 
-User-global templates and hooks are also resolved from:
-
-```text
-~/.config/daemon/agent/templates/
-~/.config/daemon/agent/hooks/
-```
+User-global include paths are currently disabled; only workspace-local `.agent/templates` and `.agent/hooks` are loaded.
 
 ---
 
@@ -280,7 +310,7 @@ IDs are unique across concurrent runs. Non-canonical IDs are rejected by `--sess
 ### Storage path
 
 ```
-.agent/sessions/<session_id>.yml
+.agent/sessions/<session_id>.yaml
 ```
 
 The file is written after each loop tick and can be inspected or recovered at any time.
