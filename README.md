@@ -87,6 +87,7 @@ Virtual filesystem access is exposed to JS code via Boa native objects that call
 - The guest has **no ambient WASI authority** — no direct filesystem or network access. Everything goes through named host functions that the host explicitly registers.
 - JavaScript execution runs inside **[Boa](https://github.com/boa-dev/boa)**, a pure-Rust ES2020 interpreter compiled directly into the guest `.wasm` binary. It has no access to the host filesystem, network, or any WASI capability — only what the Boa `Context` explicitly provides.
 - Virtual filesystem access is scoped to the `.tcow` virtual FS. The `fs_*` host functions are registered in the Wasmtime linker, but JS code reaches them only through Boa native object wrappers (`fs.readFile`, `fs.writeFile`, `fs.readdir`, `require`). The real host filesystem is not reachable from JS. All writes are buffered in-process and flushed as a new delta layer to `agent.tcow` on clean exit, providing a persistent, auditable record across runs.
+- Shell execution (`shell.run(cmd, [params])`) is **host-mediated and policy-gated**: the host receives a pre-parsed executable + argument list (instead of parsing arbitrary bash script text), then matches the reconstructed command against `metadata.shell.allow` regexes (default deny if no match). Optional `metadata.shell.timeout_secs` bounds runtime, and only session-owned child PIDs can be controlled via `shell.stdin` / `shell.kill`.
 
 ---
 
@@ -126,12 +127,3 @@ The host automatically rebuilds the guest if `guest/target/wasm32-wasip1/debug/g
 [LLM → GUEST] Final answer: 17 × 23 = 391.
 [HOST] Agent loop complete.
 ```
-
----
-
-## Related
-
-- **[tcow CLI](https://github.com/mikesmullin/tcow)** — standalone tool to inspect and manipulate `.tcow` virtual filesystem files. A copy of the source is checked out to `./tmp/tcow/`; read its `**/*.md` for format details.
-- **[docs/ADD_FS.md](docs/ADD_FS.md)** — original PRD for the TCOW host-function integration (now implemented).
-- **[docs/SHELL.md](docs/SHELL.md)** — PRD for the planned `shell.run()` / `shell.stdin()` / `shell.kill()` sandboxed shell execution API.
-- **[docs/PLAN.md](docs/PLAN.md)** — original architecture PRD; some details have diverged from the current implementation.

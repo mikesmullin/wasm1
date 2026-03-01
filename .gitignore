@@ -16,3 +16,9 @@
 # tmp
 /tmp/
 *.tcow
+.agent/sessions/
+.agent/hooks/
+.agent/msgq/
+.agent/fs/
+.agent/templates/smoke-*.yaml
+.agent/*.log

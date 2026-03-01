@@ -6,9 +6,11 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::env;
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tcow::TcowFile;
 use wasmtime::{Caller, Config, Engine, Linker, Module, Store};
@@ -19,10 +21,14 @@ const GUEST_WASM_PATH: &str = "guest/target/wasm32-wasip1/debug/guest.wasm";
 const FUEL_LIMIT: u64 = 2_000_000_000;
 /// `None` = wait indefinitely (default when no template or template omits timeout_secs).
 const SHELL_TIMEOUT_DEFAULT: Option<u64> = None;
+static MSG_ID_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // ── Template YAML structs ─────────────────────────────────────────────────────
 #[derive(Debug, Deserialize, Default)]
 struct Template {
+    #[serde(rename = "apiVersion")]
+    api_version: Option<String>,
+    kind: Option<String>,
     metadata: Option<TemplateMetadata>,
     spec: Option<TemplateSpec>,
 }
@@ -35,6 +41,8 @@ struct TemplateMetadata {
     model: Option<String>,
     /// Fallback context window size in tokens, used if the model API lookup fails.
     context_window: Option<u64>,
+    labels: Option<Vec<String>>,
+    hooks: Option<Vec<HookDef>>,
     shell: Option<ShellConfig>,
     /// Explicit tool allowlist for the session. Absent = all tools.
     tools: Option<Vec<String>>,
@@ -50,6 +58,127 @@ struct ShellConfig {
 struct TemplateSpec {
     system_prompt: Option<String>,
     max_steps: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+struct HookDef {
+    name: String,
+    on: String,
+    #[serde(default)]
+    when: HashMap<String, serde_yaml::Value>,
+    #[serde(default)]
+    jobs: HashMap<String, HookJob>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+struct HookJob {
+    #[serde(default)]
+    needs: Vec<String>,
+    #[serde(default)]
+    steps: Vec<HookStep>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+struct HookStep {
+    id: Option<String>,
+    #[serde(rename = "type")]
+    step_type: String,
+    command: Option<String>,
+    template: Option<String>,
+    prompt: Option<String>,
+    stdin: Option<String>,
+    #[serde(default)]
+    data: serde_yaml::Value,
+    #[serde(default)]
+    env: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct HookFile {
+    #[serde(default)]
+    hooks: Vec<HookDef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MsgEnvelope {
+    id: String,
+    #[serde(rename = "type")]
+    msg_type: String,
+    sender: String,
+    recipient: String,
+    priority: String,
+    status: String,
+    assignee: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "blockedBy")]
+    blocked_by: Vec<String>,
+    #[serde(default)]
+    payload: serde_json::Value,
+    #[serde(default)]
+    history: Vec<serde_json::Value>,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TeamMember {
+    index: usize,
+    session_id: String,
+    pid: Option<u32>,
+    template: Option<String>,
+    output: Option<String>,
+    status: String,
+    launched_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TeamFile {
+    team_id: String,
+    status: String,
+    created_at: String,
+    members: Vec<TeamMember>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionSnapshot {
+    #[serde(rename = "apiVersion")]
+    api_version: String,
+    kind: String,
+    metadata: SessionMetadata,
+    spec: SessionSpec,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionMetadata {
+    id: String,
+    name: String,
+    model: String,
+    status: String,
+    created: String,
+    last_pid: u32,
+    tools: Vec<String>,
+    labels: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(rename = "lastTransition")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_transition: Option<SessionTransition>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionTransition {
+    action: String,
+    from: String,
+    to: String,
+    timestamp: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionSpec {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_steps: Option<u32>,
+    messages: Vec<serde_json::Value>,
 }
 
 // ── Shell output YAML ─────────────────────────────────────────────────────────
@@ -95,6 +224,22 @@ struct HostState {
     enabled_tools: Vec<String>,
     /// Known context window size for the model (tokens); None = unknown.
     context_window: Option<u64>,
+    /// Canonical session id `<timestampMs>-<pid>-<hex4>`.
+    session_id: String,
+    /// Workspace root path used by host-side tools.
+    workspace_root: PathBuf,
+    /// Effective merged hooks (template > user > repo).
+    hooks: Vec<HookDef>,
+    /// Session creation timestamp used in snapshots.
+    session_created: String,
+    /// Current session status for transition tracking.
+    session_status: String,
+    /// Template display name used in session snapshots.
+    template_name: String,
+    /// Optional template description for session snapshots.
+    template_description: Option<String>,
+    /// Template labels for session snapshots.
+    template_labels: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,11 +314,21 @@ fn resolve_template(name: &str) -> Result<PathBuf> {
     ))
 }
 
-fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>, Option<u32>, Vec<String>, Option<u64>)> {
+fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>, Option<u32>, Vec<String>, Option<u64>, Vec<HookDef>, Option<String>, Vec<String>)> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read template: {}", path.display()))?;
     let template: Template = serde_yaml::from_str(&content)
         .with_context(|| format!("failed to parse template YAML: {}", path.display()))?;
+    if let Some(api_version) = template.api_version.as_deref() {
+        if api_version != "daemon/v1" {
+            return Err(anyhow!("unsupported apiVersion '{api_version}', expected daemon/v1"));
+        }
+    }
+    if let Some(kind) = template.kind.as_deref() {
+        if kind != "Agent" {
+            return Err(anyhow!("unsupported kind '{kind}', expected Agent"));
+        }
+    }
     let shell_cfg = template
         .metadata
         .as_ref()
@@ -191,19 +346,35 @@ fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>
     let max_steps = template.spec.as_ref().and_then(|s| s.max_steps);
     // tools: absent → all built-in tools; explicit list → only those
     let template_context_window = template.metadata.as_ref().and_then(|m| m.context_window);
+    let hooks = template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.hooks.clone())
+        .unwrap_or_default();
+    let labels = template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.labels.clone())
+        .unwrap_or_default();
+    let description = template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.description.clone());
     let tools = template.metadata
         .and_then(|m| m.tools)
         .unwrap_or_else(all_tool_names);
     println!(
-        "[HOST] Template loaded: {} shell allow-list entries, timeout: {}, system_prompt: {}, max_steps: {}, tools: [{}], context_window: {}",
+        "[HOST] Template loaded: {} shell allow-list entries, timeout: {}, system_prompt: {}, max_steps: {}, tools: [{}], hooks: {}, labels: {}, context_window: {}",
         regexes.len(),
         timeout.map(|t| format!("{t}s")).unwrap_or_else(|| "indefinite".into()),
         system_prompt.as_deref().map(|s| format!("{} chars", s.len())).unwrap_or_else(|| "none".into()),
         max_steps.map(|n| n.to_string()).unwrap_or_else(|| "indefinite".into()),
         tools.join(", "),
+        hooks.len(),
+        labels.len(),
         template_context_window.map(|n| format!("{n}")).unwrap_or_else(|| "unset".into()),
     );
-    Ok((regexes, timeout, system_prompt, max_steps, tools, template_context_window))
+    Ok((regexes, timeout, system_prompt, max_steps, tools, template_context_window, hooks, description, labels))
 }
 
 /// Query the xAI models endpoint to discover the context window for `model`.
@@ -237,8 +408,19 @@ fn lookup_model_context_window(model: &str) -> Option<u64> {
 fn main() -> Result<()> {
     let _ = from_filename(".env");
 
-    // Parse CLI args: [-t <template>] <prompt>
-    let mut args_iter = env::args().skip(1);
+    // Parse CLI args:
+    //   wasm1 cron once|watch
+    //   wasm1 [-t <template>] <prompt>
+    let all_args: Vec<String> = env::args().skip(1).collect();
+    if all_args.first().map(String::as_str) == Some("cron") {
+        let mode = all_args.get(1).map(String::as_str).unwrap_or("once");
+        return run_cron(mode);
+    }
+    if all_args.first().map(String::as_str) == Some("clean") {
+        return run_clean();
+    }
+
+    let mut args_iter = all_args.into_iter();
     let mut template_name: Option<String> = None;
     let mut prompt: Option<String> = None;
     while let Some(arg) = args_iter.next() {
@@ -249,16 +431,18 @@ fn main() -> Result<()> {
         }
     }
     let prompt =
-        prompt.ok_or_else(|| anyhow!("usage: cargo run -- [-t <template>] \"<prompt>\""))?;
+        prompt.ok_or_else(|| anyhow!("usage: cargo run -- [clean|cron <once|watch>|-t <template>] \"<prompt>\""))?;
 
     // Load template allow-list if -t was supplied
-    let (shell_allow, shell_timeout, system_prompt, max_steps, enabled_tools, template_context_window) = if let Some(ref name) = template_name {
+    let (shell_allow, shell_timeout, system_prompt, max_steps, enabled_tools, template_context_window, template_hooks, template_description, template_labels) = if let Some(ref name) = template_name {
         let path = resolve_template(name)?;
         println!("[HOST] Using template: {}", path.display());
         load_template(&path)?
     } else {
-        (Vec::new(), SHELL_TIMEOUT_DEFAULT, None, None, all_tool_names(), None)
+        (Vec::new(), SHELL_TIMEOUT_DEFAULT, None, None, all_tool_names(), None, Vec::new(), None, Vec::new())
     };
+    let effective_hooks = merge_hooks(load_global_hooks()?, template_hooks);
+    println!("[HOST] Hooks loaded: {}", effective_hooks.len());
 
     println!("[HOST] Starting agent with prompt: {:?}", prompt);
 
@@ -493,6 +677,15 @@ fn main() -> Result<()> {
 
             if let LlmDecision::ToolCall { tool, tool_call_id, .. } = &decision {
                 println!("[LLM → GUEST] Tool call: {tool} (id={tool_call_id})");
+            }
+
+            let (status, action) = match &decision {
+                LlmDecision::Final { .. } => ("success", "complete"),
+                LlmDecision::Error { .. } => ("error", "fail"),
+                LlmDecision::ToolCall { .. } => ("running", "tick"),
+            };
+            if let Err(e) = write_session_snapshot(caller.data_mut(), status, action, Some(&req), Some(&decision)) {
+                eprintln!("[HOST] session snapshot write failed: {e:#}");
             }
 
             let response = serde_json::to_string(&decision).unwrap_or_else(|_| {
@@ -794,6 +987,32 @@ fn main() -> Result<()> {
             let args: serde_json::Value =
                 serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Object(Default::default()));
 
+            if !caller.data().enabled_tools.iter().any(|t| t == &name) {
+                let resp = format!(
+                    r#"{{"error":"tool disabled by template: {}"}}"#,
+                    serde_json::to_string(&name).unwrap_or_else(|_| "\"unknown\"".to_string())
+                );
+                return write_memory(&mut caller, out_ptr, out_cap, &resp);
+            }
+
+            let hook_payload = serde_json::json!({
+                "tool_name": name.clone(),
+                "tool_input": args.clone(),
+            });
+            match run_hooks(caller.data_mut(), "pre_tool_call", &hook_payload, true) {
+                Ok(Some(reason)) => {
+                    let escaped = serde_json::to_string(&reason).unwrap_or_else(|_| "\"blocked\"".to_string());
+                    let resp = format!(r#"{{"error":{escaped}}}"#);
+                    return write_memory(&mut caller, out_ptr, out_cap, &resp);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let escaped = serde_json::to_string(&format!("hook error: {e}")).unwrap_or_else(|_| "\"hook error\"".to_string());
+                    let resp = format!(r#"{{"error":{escaped}}}"#);
+                    return write_memory(&mut caller, out_ptr, out_cap, &resp);
+                }
+            }
+
             let result: Result<String, String> = match name.as_str() {
                 "fs__file__view" => {
                     let file_path = args["filePath"]
@@ -945,8 +1164,44 @@ fn main() -> Result<()> {
                     names.sort();
                     Ok(names.join("\n"))
                 }
+                "msgq__append" => msgq_append(caller.data().workspace_root.as_path(), &args),
+                "msgq__claim" => msgq_claim(caller.data().workspace_root.as_path(), &args),
+                "msgq__list" => msgq_list(caller.data().workspace_root.as_path(), &args),
+                "msgq__await" => msgq_await(caller.data().workspace_root.as_path(), &args),
+                "msgq__update" => msgq_update(caller.data().workspace_root.as_path(), &args),
+                "msgq__archive" => msgq_archive(caller.data_mut(), &args),
+                "msgq__bcast" => msgq_bcast(caller.data().workspace_root.as_path(), &args),
+                "team__create" => team_create(caller.data().workspace_root.as_path(), &args),
+                "team__destroy" => team_destroy(caller.data().workspace_root.as_path(), &args),
                 _ => Err(format!("unknown tool: {name}")),
             };
+
+            match &result {
+                Ok(output) => {
+                    let _ = run_hooks(
+                        caller.data_mut(),
+                        "post_tool_call",
+                        &serde_json::json!({
+                            "tool_name": name,
+                            "tool_input": args,
+                            "tool_output": output,
+                        }),
+                        false,
+                    );
+                }
+                Err(error_message) => {
+                    let _ = run_hooks(
+                        caller.data_mut(),
+                        "post_tool_failure",
+                        &serde_json::json!({
+                            "tool_name": name,
+                            "tool_input": args,
+                            "error_message": error_message,
+                        }),
+                        false,
+                    );
+                }
+            }
 
             let resp = match result {
                 Ok(r) => {
@@ -962,8 +1217,31 @@ fn main() -> Result<()> {
         },
     )?;
 
-    let tcow_path = env::var("TCOW_PATH").unwrap_or_else(|_| "agent.tcow".into());
+    // Generate canonical session ID: <timestampMs>-<pid>-<hex4>
+    let session_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let session_pid = std::process::id();
+    let session_rand = {
+        let mut h = Sha1::new();
+        h.update(session_ts.to_le_bytes());
+        h.update(session_pid.to_le_bytes());
+        let digest = h.finalize();
+        format!("{:02x}{:02x}", digest[0], digest[1])
+    };
+    let session_id = format!("{session_ts}-{session_pid}-{session_rand}");
+    println!("[HOST] Session: {session_id}");
+    let session_created = now_stamp();
+    let workspace_root = env::current_dir().context("failed to get current workspace directory")?;
+
+    let tcow_dir = Path::new(".agent/fs");
+    std::fs::create_dir_all(tcow_dir).context("failed to create .agent/fs/")?;
+    let tcow_path = format!(".agent/fs/{session_id}.tcow");
     println!("[HOST] TCOW virtual FS: {tcow_path}");
+
+    let sessions_dir = Path::new(".agent/sessions");
+    std::fs::create_dir_all(sessions_dir).context("failed to create .agent/sessions/")?;
 
     let wasi = WasiCtxBuilder::new().inherit_stdio().build();
     let state = HostState {
@@ -982,15 +1260,42 @@ fn main() -> Result<()> {
         max_steps,
         enabled_tools,
         context_window,
+        session_id,
+        workspace_root,
+        hooks: effective_hooks,
+        session_created,
+        session_status: "pending".to_string(),
+        template_name: template_name.clone().unwrap_or_else(|| "solo".to_string()),
+        template_description,
+        template_labels,
     };
 
     let mut store = Store::new(&engine, state);
+    write_session_snapshot(store.data_mut(), "pending", "create", None, None)?;
     store
         .add_fuel(FUEL_LIMIT)
         .context("failed to set fuel limit")?;
 
     let instance = linker.instantiate(&mut store, &module)?;
     let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
+
+    {
+        let payload = serde_json::json!({
+            "template": template_name.clone().unwrap_or_else(|| "(none)".to_string()),
+            "prompt": store.data().prompt,
+        });
+        if let Some(reason) = run_hooks(store.data_mut(), "before_agent_start", &payload, true)? {
+            return Err(anyhow!("blocked by hook before_agent_start: {reason}"));
+        }
+        write_session_snapshot(store.data_mut(), "running", "start", None, None)?;
+        let _ = run_hooks(
+            store.data_mut(),
+            "session_start",
+            &serde_json::json!({}),
+            false,
+        )?;
+    }
+
     run.call(&mut store, ())?;
 
     // Flush buffered writes to the .tcow file
@@ -1021,11 +1326,1101 @@ fn main() -> Result<()> {
         println!("[HOST] Agent completed without final answer export.");
     }
 
+    let had_final = store.data().final_answer.is_some();
+    if !had_final {
+        write_session_snapshot(
+            store.data_mut(),
+            "stopped",
+            "stop",
+            None,
+            None,
+        )?;
+    }
+    let _ = run_hooks(
+        store.data_mut(),
+        "session_end",
+        &serde_json::json!({
+            "exit_reason": if had_final { "success" } else { "no_final" }
+        }),
+        false,
+    )?;
+
     Ok(())
 }
 
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn now_stamp() -> String {
+    now_millis().to_string()
+}
+
+fn run_cron(mode: &str) -> Result<()> {
+    let workspace_root = env::current_dir().context("failed to get current directory")?;
+    let session_id = format!("cron-{}-{}", std::process::id(), now_millis());
+    let hooks = merge_hooks(load_global_hooks()?, Vec::new());
+    match mode {
+        "once" => {
+            let _ = run_hooks_impl(
+                &hooks,
+                &workspace_root,
+                &session_id,
+                "cron_tick",
+                &serde_json::json!({
+                    "trigger": "once",
+                    "tick_at": now_stamp(),
+                }),
+                false,
+            )?;
+            Ok(())
+        }
+        "watch" => {
+            loop {
+                let _ = run_hooks_impl(
+                    &hooks,
+                    &workspace_root,
+                    &session_id,
+                    "cron_tick",
+                    &serde_json::json!({
+                        "trigger": "watch",
+                        "tick_at": now_stamp(),
+                    }),
+                    false,
+                )?;
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
+        _ => Err(anyhow!("usage: wasm1 cron [once|watch]")),
+    }
+}
+
+fn read_hook_dir(dir: &Path) -> Result<Vec<HookDef>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut hooks = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = match entry {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if ext != "yaml" && ext != "yml" {
+            continue;
+        }
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read hook file: {}", path.display()))?;
+        let parsed: HookFile = serde_yaml::from_str(&content)
+            .with_context(|| format!("failed to parse hook YAML: {}", path.display()))?;
+        hooks.extend(parsed.hooks);
+    }
+    Ok(hooks)
+}
+
+fn load_global_hooks() -> Result<Vec<HookDef>> {
+    let repo_hooks = read_hook_dir(Path::new(".agent/hooks"))?;
+    let home = env::var("HOME").unwrap_or_default();
+    let user_hooks = read_hook_dir(&PathBuf::from(home).join(".config/daemon/agent/hooks"))?;
+    Ok(merge_hooks(repo_hooks, user_hooks))
+}
+
+fn merge_hooks(low: Vec<HookDef>, high: Vec<HookDef>) -> Vec<HookDef> {
+    let mut index: HashMap<(String, String), HookDef> = HashMap::new();
+    for hook in low {
+        index.insert((hook.on.clone(), hook.name.clone()), hook);
+    }
+    for hook in high {
+        index.insert((hook.on.clone(), hook.name.clone()), hook);
+    }
+    let mut out: Vec<HookDef> = index.into_values().collect();
+    out.sort_by(|a, b| a.on.cmp(&b.on).then(a.name.cmp(&b.name)));
+    out
+}
+
+fn run_hooks(
+    state: &mut HostState,
+    event: &str,
+    payload: &serde_json::Value,
+    blocking: bool,
+) -> Result<Option<String>> {
+    run_hooks_impl(
+        &state.hooks,
+        &state.workspace_root,
+        &state.session_id,
+        event,
+        payload,
+        blocking,
+    )
+}
+
+fn run_hooks_impl(
+    hooks: &[HookDef],
+    workspace_root: &Path,
+    session_id: &str,
+    event: &str,
+    payload: &serde_json::Value,
+    blocking: bool,
+) -> Result<Option<String>> {
+    let mut base = serde_json::json!({
+        "hook": event,
+        "session_id": session_id,
+        "timestamp": now_stamp(),
+        "agent_id": "main",
+        "workspace": workspace_root.display().to_string(),
+    });
+    merge_json_object(&mut base, payload);
+
+    for hook in hooks.iter().filter(|h| h.on == event) {
+        if !hook_matches(hook, &base) {
+            continue;
+        }
+        match execute_hook(hook, &base, workspace_root) {
+            Ok(Some(reason)) => {
+                if blocking {
+                    return Ok(Some(reason));
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                if blocking {
+                    return Ok(Some(format!("hook '{}' failed: {err}", hook.name)));
+                }
+                eprintln!("[HOOK:{}] error: {err}", hook.name);
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn hook_matches(hook: &HookDef, payload: &serde_json::Value) -> bool {
+    for (key, matcher) in &hook.when {
+        let target = get_json_path(payload, key).and_then(|v| v.as_str()).unwrap_or("");
+        match matcher {
+            serde_yaml::Value::String(s) => {
+                if let Some(prefix) = s.strip_suffix('*') {
+                    if !target.starts_with(prefix) {
+                        return false;
+                    }
+                } else if target != s {
+                    return false;
+                }
+            }
+            serde_yaml::Value::Sequence(seq) => {
+                let mut any = false;
+                for entry in seq {
+                    if let serde_yaml::Value::String(s) = entry {
+                        if s == target {
+                            any = true;
+                            break;
+                        }
+                    }
+                }
+                if !any {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn execute_hook(hook: &HookDef, payload: &serde_json::Value, workspace_root: &Path) -> Result<Option<String>> {
+    let mut completed: HashMap<String, ()> = HashMap::new();
+    let mut outputs: HashMap<String, String> = HashMap::new();
+
+    while completed.len() < hook.jobs.len() {
+        let mut progressed = false;
+        let job_names: Vec<String> = hook.jobs.keys().cloned().collect();
+        for job_name in job_names {
+            if completed.contains_key(&job_name) {
+                continue;
+            }
+            let job = match hook.jobs.get(&job_name) {
+                Some(v) => v,
+                None => continue,
+            };
+            if !job.needs.iter().all(|n| completed.contains_key(n)) {
+                continue;
+            }
+            let mut job_outputs: HashMap<String, String> = HashMap::new();
+            for (idx, step) in job.steps.iter().enumerate() {
+                let step_out = execute_hook_step(step, payload, &outputs, workspace_root)
+                    .with_context(|| format!("job={job_name} step={}", step.id.clone().unwrap_or_else(|| idx.to_string())))?;
+                let step_id = step.id.clone().unwrap_or_else(|| format!("step_{idx}"));
+                job_outputs.insert(step_id.clone(), step_out.clone());
+                outputs.insert(step_id, step_out.clone());
+
+                let parsed: serde_json::Value = serde_json::from_str(&step_out).unwrap_or(serde_json::Value::Null);
+                if parsed["blocked"].as_bool().unwrap_or(false) {
+                    let reason = parsed["reason"].as_str().unwrap_or("blocked by hook").to_string();
+                    return Ok(Some(reason));
+                }
+            }
+            let _ = job_outputs;
+            completed.insert(job_name, ());
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    Ok(None)
+}
+
+fn execute_hook_step(
+    step: &HookStep,
+    payload: &serde_json::Value,
+    outputs: &HashMap<String, String>,
+    workspace_root: &Path,
+) -> Result<String> {
+    match step.step_type.as_str() {
+        "shell" => {
+            let command = render_expr_template(step.command.as_deref().unwrap_or(""), payload, outputs)?;
+            let stdin_text = render_expr_template(step.stdin.as_deref().unwrap_or(""), payload, outputs)?;
+            let mut cmd = Command::new("bash");
+            cmd.arg("-lc")
+                .arg(command)
+                .current_dir(workspace_root)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .stdin(Stdio::piped());
+            let mut child = cmd.spawn().context("failed to spawn hook shell step")?;
+            if !stdin_text.is_empty() {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    stdin.write_all(stdin_text.as_bytes()).ok();
+                }
+            }
+            let out = child.wait_with_output().context("hook shell wait failed")?;
+            if !out.status.success() {
+                return Err(anyhow!(
+                    "hook shell failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        "llm" => {
+            let template = step.template.clone().unwrap_or_default();
+            let prompt = render_expr_template(step.prompt.as_deref().unwrap_or(""), payload, outputs)?;
+            if template.is_empty() || prompt.is_empty() {
+                return Err(anyhow!("llm step requires template and prompt"));
+            }
+            let exe = env::current_exe().context("cannot resolve current executable")?;
+            let mut cmd = Command::new(exe);
+            cmd.arg("-t").arg(template).arg(prompt).current_dir(workspace_root);
+            let out = cmd.output().context("failed to run nested llm hook step")?;
+            if !out.status.success() {
+                return Err(anyhow!("nested llm hook failed"));
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines().rev() {
+                if let Some(rest) = line.strip_prefix("[HOST] Agent loop complete. Final answer: ") {
+                    return Ok(rest.to_string());
+                }
+            }
+            Ok(stdout.trim().to_string())
+        }
+        other => Err(anyhow!("unsupported hook step type: {other}")),
+    }
+}
+
+fn render_expr_template(input: &str, payload: &serde_json::Value, outputs: &HashMap<String, String>) -> Result<String> {
+    let re = Regex::new(r#"\$\{\{\s*([^}]*)\s*\}\}"#).context("failed to compile hook expression regex")?;
+    let mut out = String::new();
+    let mut last = 0;
+    for caps in re.captures_iter(input) {
+        let m = match caps.get(0) {
+            Some(v) => v,
+            None => continue,
+        };
+        out.push_str(&input[last..m.start()]);
+        let expr = caps.get(1).map(|x| x.as_str()).unwrap_or("");
+        let value = eval_hook_expr(expr, payload, outputs)?;
+        if let Some(s) = value.as_str() {
+            out.push_str(s);
+        } else if value.is_null() {
+        } else {
+            out.push_str(&value.to_string());
+        }
+        last = m.end();
+    }
+    out.push_str(&input[last..]);
+    Ok(out)
+}
+
+fn eval_hook_expr(expr: &str, payload: &serde_json::Value, outputs: &HashMap<String, String>) -> Result<serde_json::Value> {
+    let expr = expr.trim();
+    if expr.starts_with("parseJSON(") {
+        let close = expr.find(')').ok_or_else(|| anyhow!("invalid parseJSON expression"))?;
+        let inner = &expr[10..close];
+        let inner_value = eval_hook_expr(inner, payload, outputs)?;
+        let parsed: serde_json::Value = serde_json::from_str(inner_value.as_str().unwrap_or(""))
+            .context("parseJSON received invalid JSON")?;
+        let rest = expr[close + 1..].trim();
+        if let Some(path) = rest.strip_prefix('.') {
+            return Ok(get_json_path(&parsed, path).cloned().unwrap_or(serde_json::Value::Null));
+        }
+        return Ok(parsed);
+    }
+    if let Some(step_path) = expr.strip_prefix("steps.") {
+        let mut parts = step_path.split('.');
+        let id = parts.next().unwrap_or("");
+        let field = parts.next().unwrap_or("output");
+        if field == "output" {
+            return Ok(serde_json::Value::String(outputs.get(id).cloned().unwrap_or_default()));
+        }
+    }
+    Ok(get_json_path(payload, expr).cloned().unwrap_or(serde_json::Value::Null))
+}
+
+fn get_json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut current = value;
+    for seg in path.split('.') {
+        if seg.is_empty() {
+            continue;
+        }
+        current = current.get(seg)?;
+    }
+    Some(current)
+}
+
+fn merge_json_object(base: &mut serde_json::Value, extra: &serde_json::Value) {
+    if let (Some(b), Some(e)) = (base.as_object_mut(), extra.as_object()) {
+        for (k, v) in e {
+            b.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+fn session_snapshot_path(state: &HostState) -> PathBuf {
+    state
+        .workspace_root
+        .join(".agent/sessions")
+        .join(format!("{}.yaml", state.session_id))
+}
+
+fn clear_dir(path: &Path) -> Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut removed = 0u64;
+    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.is_dir() {
+            fs::remove_dir_all(&p)
+                .with_context(|| format!("failed to remove directory {}", p.display()))?;
+        } else {
+            fs::remove_file(&p)
+                .with_context(|| format!("failed to remove file {}", p.display()))?;
+        }
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn run_clean() -> Result<()> {
+    let workspace_root = env::current_dir().context("failed to get current directory")?;
+    let fs_dir = workspace_root.join(".agent/fs");
+    let msgq_dir = workspace_root.join(".agent/msgq");
+    let sessions_dir = workspace_root.join(".agent/sessions");
+
+    fs::create_dir_all(&fs_dir).with_context(|| format!("failed to create {}", fs_dir.display()))?;
+    fs::create_dir_all(&msgq_dir).with_context(|| format!("failed to create {}", msgq_dir.display()))?;
+    fs::create_dir_all(&sessions_dir)
+        .with_context(|| format!("failed to create {}", sessions_dir.display()))?;
+
+    let removed_fs = clear_dir(&fs_dir)?;
+    let removed_msgq = clear_dir(&msgq_dir)?;
+    let removed_sessions = clear_dir(&sessions_dir)?;
+
+    println!(
+        "[HOST] clean complete: .agent/fs={removed_fs}, .agent/msgq={removed_msgq}, .agent/sessions={removed_sessions}"
+    );
+    Ok(())
+}
+
+fn parse_assistant_message(assistant_msg_json: &str) -> serde_json::Value {
+    let mut value: serde_json::Value = serde_json::from_str(assistant_msg_json)
+        .unwrap_or_else(|_| serde_json::json!({"role":"assistant","content":""}));
+    if value.get("role").is_none() {
+        value["role"] = serde_json::Value::String("assistant".to_string());
+    }
+    if value.get("timestamp").is_none() {
+        value["timestamp"] = serde_json::Value::String(now_stamp());
+    }
+    if value.get("finish_reason").is_none() {
+        let finish_reason = if value
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+        {
+            "tool_calls"
+        } else {
+            "stop"
+        };
+        value["finish_reason"] = serde_json::Value::String(finish_reason.to_string());
+    }
+    value
+}
+
+fn build_session_messages(req: Option<&GuestRequest>, decision: Option<&LlmDecision>) -> Vec<serde_json::Value> {
+    let mut messages = Vec::new();
+    if let Some(req) = req {
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": req.prompt,
+            "timestamp": now_stamp(),
+        }));
+
+        for entry in &req.history {
+            messages.push(parse_assistant_message(&entry.assistant_msg_json));
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": entry.tool_call_id,
+                "name": entry.tool_name,
+                "content": format_tool_result(&entry.result_json),
+                "timestamp": now_stamp(),
+            }));
+        }
+    }
+
+    if let Some(decision) = decision {
+        match decision {
+            LlmDecision::ToolCall {
+                assistant_msg_json,
+                ..
+            } => {
+                messages.push(parse_assistant_message(assistant_msg_json));
+            }
+            LlmDecision::Final { answer, .. } => {
+                messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": answer,
+                    "tool_calls": [],
+                    "finish_reason": "stop",
+                    "timestamp": now_stamp(),
+                }));
+            }
+            LlmDecision::Error { message } => {
+                messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": format!("ERROR: {message}"),
+                    "tool_calls": [],
+                    "finish_reason": "error",
+                    "timestamp": now_stamp(),
+                }));
+            }
+        }
+    }
+
+    messages
+}
+
+fn write_session_snapshot(
+    state: &mut HostState,
+    status: &str,
+    action: &str,
+    req: Option<&GuestRequest>,
+    decision: Option<&LlmDecision>,
+) -> Result<()> {
+    let from = state.session_status.clone();
+    let snapshot = SessionSnapshot {
+        api_version: "daemon/v1".to_string(),
+        kind: "Agent".to_string(),
+        metadata: SessionMetadata {
+            id: state.session_id.clone(),
+            name: state.template_name.clone(),
+            model: state.model.clone(),
+            status: status.to_string(),
+            created: state.session_created.clone(),
+            last_pid: std::process::id(),
+            tools: state.enabled_tools.clone(),
+            labels: state.template_labels.clone(),
+            description: state.template_description.clone(),
+            last_transition: Some(SessionTransition {
+                action: action.to_string(),
+                from,
+                to: status.to_string(),
+                timestamp: now_stamp(),
+            }),
+        },
+        spec: SessionSpec {
+            system_prompt: state.system_prompt.clone(),
+            max_steps: state.max_steps,
+            messages: build_session_messages(req, decision),
+        },
+    };
+    let yaml = serde_yaml::to_string(&snapshot).context("failed to serialize session snapshot")?;
+    fs::write(session_snapshot_path(state), yaml).context("failed to write session snapshot")?;
+    state.session_status = status.to_string();
+    Ok(())
+}
+
+fn msgq_dirs(workspace_root: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), String> {
+    let root = workspace_root.join(".agent/msgq");
+    let pending = root.join("pending");
+    let assigned = root.join("assigned");
+    let archive = root.join("archive");
+    let teams = root.join("teams");
+    fs::create_dir_all(&pending).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&assigned).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&archive).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&teams).map_err(|e| e.to_string())?;
+    Ok((pending, assigned, archive, teams))
+}
+
+fn parse_message(content: &str) -> Result<(MsgEnvelope, String), String> {
+    if !content.starts_with("---\n") {
+        return Err("message missing YAML frontmatter".to_string());
+    }
+    let rest = &content[4..];
+    let marker = rest.find("\n---\n").ok_or_else(|| "message frontmatter terminator not found".to_string())?;
+    let front = &rest[..marker];
+    let body = &rest[marker + 5..];
+    let env: MsgEnvelope = serde_yaml::from_str(front).map_err(|e| format!("invalid frontmatter: {e}"))?;
+    Ok((env, body.to_string()))
+}
+
+fn render_message(env: &MsgEnvelope, body: &str) -> Result<String, String> {
+    let yaml = serde_yaml::to_string(env).map_err(|e| e.to_string())?;
+    Ok(format!("---\n{}---\n\n{}", yaml, body))
+}
+
+fn load_msg(path: &Path) -> Result<(MsgEnvelope, String), String> {
+    let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    parse_message(&raw)
+}
+
+fn save_msg(path: &Path, env: &MsgEnvelope, body: &str) -> Result<(), String> {
+    let raw = render_message(env, body)?;
+    fs::write(path, raw).map_err(|e| e.to_string())
+}
+
+fn msg_id(prefix: &str) -> String {
+    let ts = now_millis();
+    let seq = MSG_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    let seed = format!("{}-{}-{}-{}", prefix, ts, std::process::id(), seq);
+    let mut h = Sha1::new();
+    h.update(seed.as_bytes());
+    let digest = h.finalize();
+    let suffix = format!("{:02x}{:02x}{:02x}", digest[0], digest[1], digest[2]);
+    format!("{prefix}-{ts}-{seq:04x}-{suffix}")
+}
+
+fn priority_rank(priority: &str) -> i32 {
+    match priority {
+        "high" => 3,
+        "normal" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+fn is_unblocked(msg: &MsgEnvelope, archive_dir: &Path) -> bool {
+    msg.blocked_by
+        .iter()
+        .all(|id| archive_dir.join(format!("{id}.md")).exists())
+}
+
+fn msgq_append(workspace_root: &Path, args: &serde_json::Value) -> Result<String, String> {
+    let (pending, _, _, _) = msgq_dirs(workspace_root)?;
+    let id = args["id"].as_str().map(|s| s.to_string()).unwrap_or_else(|| msg_id("msg"));
+    let path = pending.join(format!("{id}.md"));
+    if path.exists() {
+        return Err(format!("message id already exists: {id}"));
+    }
+    let env = MsgEnvelope {
+        id: id.clone(),
+        msg_type: args["type"].as_str().unwrap_or("note").to_string(),
+        sender: args["sender"].as_str().unwrap_or("agent:unknown").to_string(),
+        recipient: args["recipient"].as_str().unwrap_or("broadcast").to_string(),
+        priority: args["priority"].as_str().unwrap_or("normal").to_string(),
+        status: "pending".to_string(),
+        assignee: None,
+        blocked_by: args["blockedBy"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+        payload: args.get("payload").cloned().unwrap_or_else(|| serde_json::json!({})),
+        history: Vec::new(),
+        created_at: now_stamp(),
+    };
+    let body = args["body"].as_str().unwrap_or("");
+    save_msg(&path, &env, body)?;
+    Ok(serde_json::json!({"id": id, "state": "pending"}).to_string())
+}
+
+fn msgq_list_summaries(
+    workspace_root: &Path,
+    state: &str,
+    recipient: Option<&str>,
+    assignee: Option<&str>,
+    msg_type: Option<&str>,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>, String> {
+    let (pending, assigned, archive, _) = msgq_dirs(workspace_root)?;
+    let dir = match state {
+        "pending" => pending,
+        "assigned" => assigned,
+        "archive" => archive,
+        _ => return Err(format!("invalid state: {state}")),
+    };
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let entry = match entry {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let (env, _) = match load_msg(&path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if recipient.map(|r| env.recipient != r).unwrap_or(false) {
+            continue;
+        }
+        if assignee.map(|a| env.assignee.as_deref() != Some(a)).unwrap_or(false) {
+            continue;
+        }
+        if msg_type.map(|t| env.msg_type != t).unwrap_or(false) {
+            continue;
+        }
+        out.push(serde_json::json!({
+            "id": env.id,
+            "type": env.msg_type,
+            "sender": env.sender,
+            "recipient": env.recipient,
+            "priority": env.priority,
+            "status": env.status,
+            "assignee": env.assignee,
+            "created_at": env.created_at,
+        }));
+    }
+    out.sort_by(|a, b| a["id"].as_str().unwrap_or("").cmp(b["id"].as_str().unwrap_or("")));
+    if out.len() > limit {
+        out.truncate(limit);
+    }
+    Ok(out)
+}
+
+fn msgq_list(workspace_root: &Path, args: &serde_json::Value) -> Result<String, String> {
+    let state = args["state"].as_str().unwrap_or("pending");
+    let recipient = args["recipient"].as_str();
+    let assignee = args["assignee"].as_str();
+    let msg_type = args["type"].as_str();
+    let limit = args["limit"].as_u64().unwrap_or(100) as usize;
+    let items = msgq_list_summaries(workspace_root, state, recipient, assignee, msg_type, limit)?;
+    Ok(serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string()))
+}
+
+fn msgq_claim(workspace_root: &Path, args: &serde_json::Value) -> Result<String, String> {
+    let (pending, assigned, archive, _) = msgq_dirs(workspace_root)?;
+    let assignee = args["assignee"].as_str().unwrap_or("agent:unknown").to_string();
+    let recipient_filter = args["recipient"].as_str();
+    let type_filter = args["type"].as_str();
+
+    let mut candidates: Vec<(PathBuf, MsgEnvelope, String)> = Vec::new();
+    if let Some(id) = args["id"].as_str() {
+        let path = pending.join(format!("{id}.md"));
+        if !path.exists() {
+            return Err(format!("message not found in pending: {id}"));
+        }
+        let (env, body) = load_msg(&path)?;
+        candidates.push((path, env, body));
+    } else {
+        for entry in fs::read_dir(&pending).map_err(|e| e.to_string())? {
+            let entry = match entry {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+            let (env, body) = match load_msg(&path) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if recipient_filter.map(|r| env.recipient != r).unwrap_or(false) {
+                continue;
+            }
+            if type_filter.map(|t| env.msg_type != t).unwrap_or(false) {
+                continue;
+            }
+            if !is_unblocked(&env, &archive) {
+                continue;
+            }
+            candidates.push((path, env, body));
+        }
+        candidates.sort_by(|a, b| {
+            priority_rank(&b.1.priority)
+                .cmp(&priority_rank(&a.1.priority))
+                .then(a.1.created_at.cmp(&b.1.created_at))
+        });
+    }
+
+    for (from_path, mut env, body) in candidates {
+        if !is_unblocked(&env, &archive) {
+            continue;
+        }
+        let to_path = assigned.join(format!("{}.md", env.id));
+        if fs::rename(&from_path, &to_path).is_err() {
+            continue;
+        }
+        env.status = "assigned".to_string();
+        env.assignee = Some(assignee.clone());
+        env.history.push(serde_json::json!({
+            "event": "claimed",
+            "timestamp": now_stamp(),
+            "assignee": assignee,
+        }));
+        save_msg(&to_path, &env, &body)?;
+        return Ok(serde_json::json!({"id": env.id, "state": "assigned", "assignee": env.assignee}).to_string());
+    }
+
+    Err("no eligible pending message found".to_string())
+}
+
+fn msgq_await(workspace_root: &Path, args: &serde_json::Value) -> Result<String, String> {
+    let state = args["state"].as_str().unwrap_or("pending");
+    let recipient = args["recipient"].as_str();
+    let assignee = args["assignee"].as_str();
+    let msg_type = args["type"].as_str();
+    let limit = args["limit"].as_u64().unwrap_or(100) as usize;
+    let min_count = args["min_count"].as_u64().map(|v| v as usize);
+    let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(0);
+    let poll_ms = args["poll_ms"].as_u64().unwrap_or(500);
+
+    let start = Instant::now();
+    let mut prev = String::new();
+    loop {
+        let items = msgq_list_summaries(workspace_root, state, recipient, assignee, msg_type, limit)?;
+        let fingerprint = serde_json::to_string(&items).unwrap_or_default();
+        if let Some(min) = min_count {
+            if items.len() >= min {
+                return Ok(serde_json::json!({"reason":"min_count_reached","items":items}).to_string());
+            }
+        } else if !items.is_empty() && prev.is_empty() {
+            return Ok(serde_json::json!({"reason":"items_available","items":items}).to_string());
+        } else if !prev.is_empty() && prev != fingerprint {
+            return Ok(serde_json::json!({"reason":"queue_changed","items":items}).to_string());
+        }
+        prev = fingerprint;
+
+        if timeout_ms > 0 && start.elapsed() >= Duration::from_millis(timeout_ms) {
+            let items = msgq_list_summaries(workspace_root, state, recipient, assignee, msg_type, limit)?;
+            return Ok(serde_json::json!({"reason":"timeout","items":items}).to_string());
+        }
+        std::thread::sleep(Duration::from_millis(poll_ms.max(10)));
+    }
+}
+
+fn msgq_update(workspace_root: &Path, args: &serde_json::Value) -> Result<String, String> {
+    let (_, assigned, _, _) = msgq_dirs(workspace_root)?;
+    let id = args["id"].as_str().ok_or_else(|| "missing id".to_string())?;
+    let path = assigned.join(format!("{id}.md"));
+    if !path.exists() {
+        return Err(format!("assigned message not found: {id}"));
+    }
+    let (mut env, mut body) = load_msg(&path)?;
+    if let Some(a) = args["assignee"].as_str() {
+        if env.assignee.as_deref() != Some(a) {
+            return Err("assignee mismatch".to_string());
+        }
+    }
+    if let Some(status) = args["status"].as_str() {
+        if status != "assigned" && status != "in_progress" {
+            return Err("status must be assigned or in_progress".to_string());
+        }
+        env.status = status.to_string();
+    }
+    if args.get("payload").is_some() {
+        env.payload = args["payload"].clone();
+    }
+    if let Some(extra) = args["body_append"].as_str() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(extra);
+    }
+    env.history.push(serde_json::json!({
+        "event": args["history_event"].as_str().unwrap_or("updated"),
+        "timestamp": now_stamp(),
+    }));
+    save_msg(&path, &env, &body)?;
+    Ok(serde_json::json!({"id": id, "status": env.status}).to_string())
+}
+
+fn msgq_archive(state: &mut HostState, args: &serde_json::Value) -> Result<String, String> {
+    let (pending, assigned, archive, _) = msgq_dirs(&state.workspace_root)?;
+    let id = args["id"].as_str().ok_or_else(|| "missing id".to_string())?;
+    let from_state = args["from_state"].as_str().map(|s| s.to_string()).unwrap_or_else(|| {
+        if assigned.join(format!("{id}.md")).exists() {
+            "assigned".to_string()
+        } else {
+            "pending".to_string()
+        }
+    });
+    let from_path = match from_state.as_str() {
+        "assigned" => assigned.join(format!("{id}.md")),
+        "pending" => pending.join(format!("{id}.md")),
+        _ => return Err("from_state must be assigned or pending".to_string()),
+    };
+    if !from_path.exists() {
+        return Err(format!("message not found: {id}"));
+    }
+    let (mut env, body) = load_msg(&from_path)?;
+    if from_state == "assigned" {
+        if let Some(a) = args["assignee"].as_str() {
+            if env.assignee.as_deref() != Some(a) {
+                return Err("assignee mismatch".to_string());
+            }
+        }
+    }
+
+    let resolution = args["resolution"].as_str().unwrap_or("completed");
+    if resolution == "completed" {
+        let payload = serde_json::json!({
+            "task_id": env.id,
+            "task_type": env.msg_type,
+            "result_summary": env.payload["summary"].as_str().unwrap_or(""),
+            "files_changed": env.payload["files_changed"].clone(),
+        });
+        if let Some(reason) = run_hooks(state, "task_completed", &payload, true).map_err(|e| e.to_string())? {
+            return Err(format!("task_completed blocked: {reason}"));
+        }
+    }
+
+    if args.get("final_payload").is_some() {
+        env.payload = args["final_payload"].clone();
+    }
+    env.status = "archive".to_string();
+    env.history.push(serde_json::json!({
+        "event": "archived",
+        "resolution": resolution,
+        "timestamp": now_stamp(),
+    }));
+
+    let to_path = archive.join(format!("{id}.md"));
+    fs::rename(&from_path, &to_path).map_err(|e| e.to_string())?;
+    save_msg(&to_path, &env, &body)?;
+    Ok(serde_json::json!({"id": id, "state": "archive", "resolution": resolution}).to_string())
+}
+
+fn msgq_bcast(workspace_root: &Path, args: &serde_json::Value) -> Result<String, String> {
+    let recipients = args["recipients"].as_array().ok_or_else(|| "missing recipients".to_string())?;
+    let mut ids = Vec::new();
+    for recipient in recipients {
+        let recipient = match recipient.as_str() {
+            Some(v) => v,
+            None => continue,
+        };
+        let mut append_args = serde_json::json!({
+            "type": args["type"].as_str().unwrap_or("note"),
+            "sender": args["sender"].as_str().unwrap_or("agent:unknown"),
+            "recipient": recipient,
+            "priority": args["priority"].as_str().unwrap_or("normal"),
+            "payload": args["payload"].clone(),
+            "body": args["body"].as_str().unwrap_or(""),
+        });
+        if append_args["payload"].is_null() {
+            append_args["payload"] = serde_json::json!({});
+        }
+        let created = msgq_append(workspace_root, &append_args)?;
+        let parsed: serde_json::Value = serde_json::from_str(&created).unwrap_or_default();
+        if let Some(id) = parsed["id"].as_str() {
+            ids.push(id.to_string());
+        }
+    }
+    Ok(serde_json::json!({"count": ids.len(), "ids": ids}).to_string())
+}
+
+fn team_create(workspace_root: &Path, args: &serde_json::Value) -> Result<String, String> {
+    let (_, _, _, teams) = msgq_dirs(workspace_root)?;
+    let workers = args["workers"].as_array().ok_or_else(|| "missing workers".to_string())?;
+    let team_id = args["team_id"].as_str().map(|s| s.to_string()).unwrap_or_else(|| msg_id("team"));
+    let mut members = Vec::new();
+    let mut launched = 0usize;
+    let mut failed = 0usize;
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+
+    for (index, worker) in workers.iter().enumerate() {
+        let output_path = worker["output"].as_str().map(|s| s.to_string());
+        let mut cmd = Command::new(&exe);
+        if let Some(raw_args) = worker["args"].as_array() {
+            for arg in raw_args {
+                if let Some(s) = arg.as_str() {
+                    cmd.arg(s);
+                }
+            }
+        } else {
+            let template = worker["template"].as_str().ok_or_else(|| "worker missing template".to_string())?;
+            let prompt = worker["prompt"].as_str().ok_or_else(|| "worker missing prompt".to_string())?;
+            cmd.arg("-t").arg(template).arg(prompt);
+        }
+        cmd.current_dir(workspace_root);
+        if let Some(path) = &output_path {
+            let abs = workspace_root.join(path);
+            if let Some(parent) = abs.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(abs)
+                .map_err(|e| e.to_string())?;
+            let file2 = file.try_clone().map_err(|e| e.to_string())?;
+            cmd.stdout(Stdio::from(file));
+            cmd.stderr(Stdio::from(file2));
+        } else {
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+        }
+
+        let launched_at = now_stamp();
+        match cmd.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                launched += 1;
+                members.push(TeamMember {
+                    index,
+                    session_id: worker["session_id"].as_str().map(|s| s.to_string()).unwrap_or_else(|| format!("{}-{}-{:04x}", now_millis(), pid, (pid ^ (now_millis() as u32)) & 0xffff)),
+                    pid: Some(pid),
+                    template: worker["template"].as_str().map(str::to_string),
+                    output: output_path,
+                    status: "launched".to_string(),
+                    launched_at,
+                });
+            }
+            Err(_) => {
+                failed += 1;
+                members.push(TeamMember {
+                    index,
+                    session_id: worker["session_id"].as_str().unwrap_or("").to_string(),
+                    pid: None,
+                    template: worker["template"].as_str().map(str::to_string),
+                    output: output_path,
+                    status: "failed_fast".to_string(),
+                    launched_at,
+                });
+            }
+        }
+    }
+
+    let team_file = TeamFile {
+        team_id: team_id.clone(),
+        status: "active".to_string(),
+        created_at: now_stamp(),
+        members: members.clone(),
+    };
+    let path = teams.join(format!("{team_id}.yml"));
+    let yaml = serde_yaml::to_string(&team_file).map_err(|e| e.to_string())?;
+    fs::write(&path, yaml).map_err(|e| e.to_string())?;
+
+    Ok(serde_json::json!({
+        "team_id": team_id,
+        "status": "active",
+        "path": path.strip_prefix(workspace_root).unwrap_or(&path).display().to_string(),
+        "launched_count": launched,
+        "failed_count": failed,
+        "members": members,
+    }).to_string())
+}
+
+fn team_destroy(workspace_root: &Path, args: &serde_json::Value) -> Result<String, String> {
+    let (_, _, _, teams) = msgq_dirs(workspace_root)?;
+    let team_id = args["team_id"].as_str().ok_or_else(|| "missing team_id".to_string())?;
+    let path = teams.join(format!("{team_id}.yml"));
+    if !path.exists() {
+        return Err(format!("team not found: {team_id}"));
+    }
+    let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let mut team: TeamFile = serde_yaml::from_str(&raw).map_err(|e| e.to_string())?;
+    let signal_name = args["signal"].as_str().unwrap_or("SIGQUIT");
+    let force_after_ms = args["force_after_ms"].as_u64().unwrap_or(1500);
+    let signum = match signal_name {
+        "SIGTERM" => libc::SIGTERM,
+        "SIGKILL" => libc::SIGKILL,
+        "SIGINT" => libc::SIGINT,
+        "SIGHUP" => libc::SIGHUP,
+        "SIGQUIT" => libc::SIGQUIT,
+        _ => return Err(format!("invalid signal: {signal_name}")),
+    };
+
+    let mut results = Vec::new();
+    for member in &team.members {
+        let status = if let Some(pid) = member.pid {
+            let rc = unsafe { libc::kill(pid as libc::pid_t, signum) };
+            if rc != 0 {
+                "not_found".to_string()
+            } else {
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_millis(force_after_ms) {
+                    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+                    if !alive {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+                if alive {
+                    let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    "signal_sent_still_alive".to_string()
+                } else {
+                    "stopped".to_string()
+                }
+            }
+        } else {
+            "missing_pid".to_string()
+        };
+        results.push(serde_json::json!({
+            "index": member.index,
+            "session_id": member.session_id,
+            "pid": member.pid,
+            "status": status,
+        }));
+    }
+
+    team.status = "destroyed".to_string();
+    if args["remove_file"].as_bool().unwrap_or(false) {
+        let _ = fs::remove_file(&path);
+    } else {
+        let yaml = serde_yaml::to_string(&team).map_err(|e| e.to_string())?;
+        fs::write(&path, yaml).map_err(|e| e.to_string())?;
+    }
+
+    Ok(serde_json::json!({"team_id": team_id, "members": results}).to_string())
+}
+
 fn all_tool_names() -> Vec<String> {
-    ["js_exec", "fs__file__view", "fs__file__create", "fs__file__edit", "fs__directory__list"]
+    [
+        "js_exec",
+        "fs__file__view",
+        "fs__file__create",
+        "fs__file__edit",
+        "fs__directory__list",
+        "msgq__append",
+        "msgq__claim",
+        "msgq__list",
+        "msgq__await",
+        "msgq__update",
+        "msgq__archive",
+        "msgq__bcast",
+        "team__create",
+        "team__destroy",
+    ]
         .iter()
         .map(|s| s.to_string())
         .collect()
@@ -1062,6 +2457,51 @@ No fetch, no Node built-ins.",
             "fs__directory__list",
             "List the top-level entries under a directory in the virtual .tcow filesystem.",
             r#"{"type":"object","properties":{"path":{"type":"string","description":"Directory path to list."}},"required":["path"]}"#,
+        ),
+        (
+            "msgq__append",
+            "Create a new pending message in .agent/msgq/pending.",
+            r#"{"type":"object","properties":{"id":{"type":"string"},"type":{"type":"string"},"sender":{"type":"string"},"recipient":{"type":"string"},"priority":{"type":"string"},"blockedBy":{"type":"array","items":{"type":"string"}},"payload":{"type":"object"},"body":{"type":"string"}}}"#,
+        ),
+        (
+            "msgq__claim",
+            "Claim one pending message and move it to assigned.",
+            r#"{"type":"object","properties":{"id":{"type":"string"},"assignee":{"type":"string"},"recipient":{"type":"string"},"type":{"type":"string"}}}"#,
+        ),
+        (
+            "msgq__list",
+            "List msgq messages with optional state and field filters.",
+            r#"{"type":"object","properties":{"state":{"type":"string"},"recipient":{"type":"string"},"assignee":{"type":"string"},"type":{"type":"string"},"limit":{"type":"number"}}}"#,
+        ),
+        (
+            "msgq__await",
+            "Block until a filtered queue view changes or min_count is reached.",
+            r#"{"type":"object","properties":{"state":{"type":"string"},"recipient":{"type":"string"},"assignee":{"type":"string"},"type":{"type":"string"},"limit":{"type":"number"},"min_count":{"type":"number"},"timeout_ms":{"type":"number"},"poll_ms":{"type":"number"}}}"#,
+        ),
+        (
+            "msgq__update",
+            "Update an assigned message and append a history event.",
+            r#"{"type":"object","properties":{"id":{"type":"string"},"assignee":{"type":"string"},"status":{"type":"string"},"payload":{"type":"object"},"body_append":{"type":"string"},"history_event":{"type":"string"}},"required":["id"]}"#,
+        ),
+        (
+            "msgq__archive",
+            "Move a message to archive with a resolution status.",
+            r#"{"type":"object","properties":{"id":{"type":"string"},"from_state":{"type":"string"},"assignee":{"type":"string"},"resolution":{"type":"string"},"final_payload":{"type":"object"}},"required":["id"]}"#,
+        ),
+        (
+            "msgq__bcast",
+            "Fan out one payload to multiple recipients as pending messages.",
+            r#"{"type":"object","properties":{"recipients":{"type":"array","items":{"type":"string"}},"sender":{"type":"string"},"type":{"type":"string"},"priority":{"type":"string"},"payload":{"type":"object"},"body":{"type":"string"}},"required":["recipients"]}"#,
+        ),
+        (
+            "team__create",
+            "Launch worker wasm1 processes asynchronously and persist team metadata.",
+            r#"{"type":"object","properties":{"team_id":{"type":"string"},"workers":{"type":"array","items":{"type":"object"}}},"required":["workers"]}"#,
+        ),
+        (
+            "team__destroy",
+            "Send stop signals to all worker processes in a team.",
+            r#"{"type":"object","properties":{"team_id":{"type":"string"},"signal":{"type":"string"},"force_after_ms":{"type":"number"},"remove_file":{"type":"boolean"}},"required":["team_id"]}"#,
         ),
     ];
 

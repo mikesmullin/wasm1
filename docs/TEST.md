@@ -273,16 +273,20 @@ Covered inline by T4, T8. The `.out` path returned by `shell.run` is passed to
 
 ---
 
-### T12 — `tcow ls agent.tcow` shows `/tmp/*.out.json` files after a run
+### T12 — `.agent/fs/<session_id>.tcow` accumulates `/tmp/*.out.json` files after a run
 
 After any successful `shell.run` call, the `.out.json` files are flushed to the
-persistent `agent.tcow` layer.  Inspect them:
+per-session `.agent/fs/<session_id>.tcow` layer.  Find the latest session file and inspect it:
 
 ```bash
-tcow ls agent.tcow | grep '\.out\.json'
+# find the most recent tcow file
+latest=$(ls -t .agent/fs/*.tcow | head -n1)
+echo "$latest"
+
+tcow ls "$latest" | grep '\.out\.json'
 # e.g. /tmp/1772328876452_eb8652.out.json
 
-tcow cat agent.tcow tmp/1772328876452_eb8652.out.json
+tcow cat "$latest" tmp/1772328876452_eb8652.out.json
 # prints the full JSON
 ```
 
@@ -328,8 +332,8 @@ cargo run -- -t solo \
   2>&1 | grep "\[GUEST\] Tool result" | head -1
 ```
 
-**Expected:** The YAML content from the previous run is returned — `agent.tcow`
-delta layers are read across process restarts without re-running the command.
+**Expected:** The YAML content from the previous run is returned — `.agent/fs/<session_id>.tcow`
+delta layers are read within the same session without re-running the command.
 
 **Result: ✅ PASS** (returned T4's `echo hello world` JSON, `exit_code: 0`, `stdout: "hello world\n"`)
 
