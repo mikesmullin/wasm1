@@ -18,7 +18,9 @@
 *.tcow
 .agent/sessions/
 .agent/hooks/
+.agent/cron/
 .agent/msgq/
 .agent/fs/
 .agent/templates/smoke-*.yaml
 .agent/*.log
+/config.yaml

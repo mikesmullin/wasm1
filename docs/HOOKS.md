@@ -132,7 +132,7 @@ Use `${{ ... }}` in hook fields.
 
 | Event | Fired by | Payload extras |
 |---|---|---|
-| `cron_tick` | `cron watch` (each interval) or `cron once` (single trigger) | `trigger: "watch"\|"once"`, `tick_at` |
+| `cron_tick` | `cron watch` (each interval) or `cron once` (single trigger) | `trigger: "watch"\|"once"`, `tick_at`, `agent_name`, `hook_name`, `cron.stateKey`, `cron.nowMs`, `cron.state` |
 
 ### Session lifecycle
 
@@ -215,6 +215,7 @@ Fires a single `cron_tick` event then exits. Useful for testing or one-shot sche
 
 ```bash
 wasm1 cron once
+wasm1 cron once -v
 ```
 
 ### `cron watch`
@@ -223,9 +224,129 @@ Fires `cron_tick` events on each interval and loops indefinitely. Exits graceful
 
 ```bash
 wasm1 cron watch
+wasm1 cron watch -v
 ```
 
 Intended for use with a process supervisor such as systemd.
+
+### Cron loop interval config (`config.yaml`)
+
+`cron watch` evaluates hooks on a fixed loop interval configured in workspace-root `config.yaml`:
+
+```yaml
+cron:
+  interval_ms: 60000
+```
+
+- Default: `60000` (1 minute)
+- If `config.yaml` is missing at cron startup, runtime creates it automatically with this default.
+- This interval is an upper bound on scheduling resolution: hooks cannot run more frequently than the watch loop checks.
+
+Example: even if a hook returns `nextRunInMs: 10`, if `interval_ms` is `600000` (10 minutes), that hook will not be reconsidered until the next 10-minute loop tick.
+
+### Verbose mode (`-v`)
+
+When `-v` is passed to `cron once` or `cron watch`, runtime prints colored progress output:
+
+- startup:
+  - each discovered `cron_tick` hook and whether it is enabled
+  - total cron hook count
+- each cron iteration, per hook:
+  - `RUN` or `SKIP`
+  - skip reason (for example, disabled or `nextRunAt` still in the future)
+  - for `RUN`, completion status and hook duration in ms
+- iteration summary:
+  - hooks ran vs skipped
+  - success vs failure counts
+  - total elapsed time for the iteration
+
+---
+
+## Cron state file (`.agent/cron/state.yaml`)
+
+Cron hooks persist scheduling state in:
+
+```text
+.agent/cron/state.yaml
+```
+
+Top-level shape is a map with one key per hook identity:
+
+```yaml
+samy-tracker:samy-tracker-cron-tick:
+  lastRunAt: 1772351291154
+  nextRunAt: 1772351411154
+  nextRunInMs: 120000
+  notes: "retry after Discord warmup"
+```
+
+- Key format: `<agent_name>:<hook.name>`
+- `lastRunAt`: set by runtime at end of each hook run (unix ms)
+- `nextRunAt`: absolute unix ms when hook should run next
+- Any extra keys returned by the hook's LLM output are stored verbatim
+
+`cron watch` uses `nextRunAt` to decide whether each hook is due; hooks with `nextRunAt > now` are skipped for that tick.
+
+---
+
+## Cron LLM scheduling contract
+
+For `cron_tick` hooks that execute `llm` steps, runtime parses the final LLM output as JSON (when possible).
+
+Recommended fields in structured output:
+
+- `nextRunInMs` (number): relative delay in milliseconds; runtime computes `nextRunAt = now + nextRunInMs`
+- `nextRunAt` (number): absolute unix ms (used if `nextRunInMs` is absent)
+
+If both are present, `nextRunInMs` takes precedence.
+
+Use `nextRunInMs` whenever possible (avoids clock math in prompts).
+
+Examples:
+
+```json
+{"status":"noop","message":"not time yet","nextRunInMs":120000}
+```
+
+```json
+{"status":"failed","message":"discord still warming up","nextRunInMs":5000,"attempt":2}
+```
+
+```json
+{"status":"notified","message":"sent alert","nextRunInMs":120000}
+```
+
+### Example: pass cron state into LLM prompt
+
+Use hook payload variables to give the model continuity between runs:
+
+```yaml
+hooks:
+  - name: samy-tracker-cron-tick
+    on: cron_tick
+    jobs:
+      run:
+        steps:
+          - type: llm
+            template: samy-tracker
+            prompt: |
+              go
+              nowMs: ${{ cron.nowMs }}
+              stateKey: ${{ cron.stateKey }}
+              priorState: ${{ cron.state }}
+```
+
+In the template system prompt, instruct the model to parse `nowMs` + `priorState` and decide whether to run now or wait.
+
+Example decision rule:
+
+- if `priorState.lastRunAt` exists and `nowMs - priorState.lastRunAt < 120000`, return:
+
+```json
+{"status":"noop","message":"waiting for next interval","nextRunInMs":120000 - (nowMs - priorState.lastRunAt)}
+```
+
+This enables stable continuity in `cron watch` without requiring external schedulers per hook.
 
 ---
 

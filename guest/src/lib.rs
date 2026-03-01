@@ -23,6 +23,7 @@ struct HistoryEntry {
     result_json: String,
 }
 
+
 #[derive(Debug, Serialize)]
 struct GuestRequest<'a> {
     prompt: &'a str,
@@ -151,8 +152,8 @@ fn vfs_list(dir: &str) -> Result<String, i32> {
 /// AI policy error message shown when the LLM attempts to use child_process.
 const CHILD_PROCESS_POLICY_MSG: &str =
     "AI Policy Error: Use of child_process is prohibited for security reasons. \
-     Please use require('shell').run(cmd, args) which returns a string path to a JSON \
-     file in the virtual filesystem containing { exit_code, stdout, stderr }.";
+    Please use require('shell').run(cmd, args) which returns an object { pid, path }, \
+    where path points to a JSON file in the virtual filesystem containing { exit_code, stdout, stderr }.";
 
 // ── child_process policy mock ─────────────────────────────────────────────────
 

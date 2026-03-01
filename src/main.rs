@@ -19,6 +19,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, add_to_linker as wasi_add_to_linker
 const DEFAULT_MODEL: &str = "grok-4-1-fast-reasoning";
 const GUEST_WASM_PATH: &str = "guest/target/wasm32-wasip1/debug/guest.wasm";
 const FUEL_LIMIT: u64 = 2_000_000_000;
+const DEFAULT_CRON_INTERVAL_MS: u64 = 60_000;
 /// `None` = wait indefinitely (default when no template or template omits timeout_secs).
 const SHELL_TIMEOUT_DEFAULT: Option<u64> = None;
 static MSG_ID_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -101,6 +102,12 @@ struct HookStep {
 struct HookFile {
     #[serde(default)]
     hooks: Vec<HookDef>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HookRunResult {
+    blocked_reason: Option<String>,
+    last_llm_output: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,7 +370,7 @@ fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>
         .and_then(|m| m.max_validation_fails);
     if let Some(validate_code) = validate_fn.as_deref() {
         let validation_prompt = format!(
-            "\n\nYour reply must cause the following function to return truthy:\n```js\n{validate_code}```"
+            "\n\nYour final/stop (non-intermediate) reply must cause the following function to return truthy:\n```js\n{validate_code}```"
         );
         let mut base = system_prompt.unwrap_or_default();
         base.push_str(&validation_prompt);
@@ -446,24 +453,29 @@ fn main() -> Result<()> {
     if all_args.first().map(String::as_str) == Some("cron") {
         let mode = all_args.get(1).map(String::as_str).unwrap_or("once");
         let mut cron_template: Option<String> = None;
+        let mut cron_verbose = false;
         let mut idx = 2usize;
         while idx < all_args.len() {
             match all_args[idx].as_str() {
                 "-t" | "--template" => {
                     if idx + 1 >= all_args.len() {
-                        return Err(anyhow!("usage: cargo run -- cron [once|watch] [-t <template>]"));
+                        return Err(anyhow!("usage: cargo run -- cron [once|watch] [-t <template>] [-v]"));
                     }
                     cron_template = Some(all_args[idx + 1].clone());
                     idx += 2;
                 }
+                "-v" | "--verbose" => {
+                    cron_verbose = true;
+                    idx += 1;
+                }
                 other => {
                     return Err(anyhow!(
-                        "unknown cron arg: {other}. usage: cargo run -- cron [once|watch] [-t <template>]"
+                        "unknown cron arg: {other}. usage: cargo run -- cron [once|watch] [-t <template>] [-v]"
                     ));
                 }
             }
         }
-        return run_cron(mode, cron_template.as_deref());
+        return run_cron(mode, cron_template.as_deref(), cron_verbose);
     }
     if all_args.first().map(String::as_str) == Some("clean") {
         return run_clean();
@@ -1436,8 +1448,90 @@ fn now_stamp() -> String {
     now_millis().to_string()
 }
 
-fn run_cron(mode: &str, template_name: Option<&str>) -> Result<()> {
-    let workspace_root = env::current_dir().context("failed to get current directory")?;
+fn looks_like_workspace_root(dir: &Path) -> bool {
+    dir.join(".agent").exists()
+        || dir.join("Cargo.toml").exists()
+        || dir.join("config.yaml").exists()
+}
+
+fn resolve_workspace_root_for_cron() -> Result<PathBuf> {
+    if let Ok(from_env) = env::var("WASM1_WORKSPACE_ROOT") {
+        let p = PathBuf::from(from_env);
+        if looks_like_workspace_root(&p) {
+            return Ok(p);
+        }
+    }
+
+    let cwd = env::current_dir().context("failed to get current directory")?;
+    if looks_like_workspace_root(&cwd) {
+        return Ok(cwd);
+    }
+
+    if let Ok(exe) = env::current_exe() {
+        let exe_resolved = fs::canonicalize(&exe).unwrap_or(exe);
+        for ancestor in exe_resolved.ancestors() {
+            if looks_like_workspace_root(ancestor) {
+                return Ok(ancestor.to_path_buf());
+            }
+        }
+    }
+
+    Ok(cwd)
+}
+
+fn load_or_init_cron_interval_ms(workspace_root: &Path) -> Result<u64> {
+    let path = workspace_root.join("config.yaml");
+    if !path.exists() {
+        let default_cfg = serde_yaml::to_string(&serde_json::json!({
+            "cron": {
+                "interval_ms": DEFAULT_CRON_INTERVAL_MS
+            }
+        }))
+        .context("failed to serialize default config.yaml")?;
+        fs::write(&path, default_cfg)
+            .with_context(|| format!("failed to create {}", path.display()))?;
+        return Ok(DEFAULT_CRON_INTERVAL_MS);
+    }
+
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(DEFAULT_CRON_INTERVAL_MS);
+    }
+
+    let yaml_val: serde_yaml::Value = serde_yaml::from_str(&text)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let json_val = serde_json::to_value(yaml_val).context("failed to convert config YAML")?;
+
+    let interval = json_val
+        .get("cron")
+        .and_then(|v| v.get("interval_ms"))
+        .and_then(value_as_i64)
+        .filter(|v| *v > 0)
+        .map(|v| v as u64)
+        .unwrap_or(DEFAULT_CRON_INTERVAL_MS);
+
+    Ok(interval)
+}
+
+#[derive(Debug, Default)]
+struct CronIterationStats {
+    hooks_ran: usize,
+    hooks_skipped: usize,
+    hooks_success: usize,
+    hooks_failed: usize,
+    elapsed_ms: u128,
+}
+
+fn c24(text: &str, r: u8, g: u8, b: u8) -> String {
+    format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
+}
+
+fn run_cron(mode: &str, template_name: Option<&str>, verbose: bool) -> Result<()> {
+    let workspace_root = resolve_workspace_root_for_cron()?;
+    env::set_current_dir(&workspace_root)
+        .with_context(|| format!("failed to set current dir to {}", workspace_root.display()))?;
+    let cron_interval_ms = load_or_init_cron_interval_ms(&workspace_root)?;
     let session_id = format!("cron-{}-{}", std::process::id(), now_millis());
     let global_hooks = load_global_hooks()?;
     let template_hooks = if let Some(name) = template_name {
@@ -1448,41 +1542,353 @@ fn run_cron(mode: &str, template_name: Option<&str>) -> Result<()> {
     };
     let hooks = merge_hooks(global_hooks, template_hooks)
         .into_iter()
-        .filter(|h| h.on == "cron_tick" && h.enabled.unwrap_or(true))
+        .filter(|h| h.on == "cron_tick")
         .collect::<Vec<_>>();
+
+    if verbose {
+        println!(
+            "{} {}",
+            c24("[cron]", 120, 180, 255),
+            c24("startup: discovered cron_tick hooks", 200, 210, 220)
+        );
+        println!(
+            "{} {} {}ms ({})",
+            c24("[cron]", 120, 180, 255),
+            c24("loop interval:", 200, 210, 220),
+            c24(&cron_interval_ms.to_string(), 160, 200, 255),
+            workspace_root.join("config.yaml").display(),
+        );
+        for hook in &hooks {
+            let enabled = hook.enabled.unwrap_or(true);
+            let mark = if enabled {
+                c24("✓", 110, 220, 140)
+            } else {
+                c24("✗", 255, 160, 100)
+            };
+            let state = if enabled {
+                c24("enabled", 110, 220, 140)
+            } else {
+                c24("disabled", 255, 160, 100)
+            };
+            println!("  {} {} ({})", mark, hook.name, state);
+        }
+        println!(
+            "{} {} {}",
+            c24("[cron]", 120, 180, 255),
+            c24("hook count:", 200, 210, 220),
+            c24(&hooks.len().to_string(), 160, 200, 255)
+        );
+    }
+
     match mode {
         "once" => {
-            let _ = run_hooks_impl(
+            let stats = run_cron_tick(
                 &hooks,
                 &workspace_root,
                 &session_id,
-                "cron_tick",
-                &serde_json::json!({
-                    "trigger": "once",
-                    "tick_at": now_stamp(),
-                }),
+                template_name,
+                "once",
                 false,
+                verbose,
             )?;
+            if verbose {
+                println!(
+                    "{} {} ran={}, skipped={}, success={}, failed={}, total={}ms",
+                    c24("[cron]", 120, 180, 255),
+                    c24("summary:", 200, 210, 220),
+                    c24(&stats.hooks_ran.to_string(), 160, 200, 255),
+                    c24(&stats.hooks_skipped.to_string(), 160, 200, 255),
+                    c24(&stats.hooks_success.to_string(), 110, 220, 140),
+                    c24(&stats.hooks_failed.to_string(), 255, 120, 120),
+                    c24(&stats.elapsed_ms.to_string(), 180, 180, 255),
+                );
+            }
             Ok(())
         }
         "watch" => {
             loop {
-                let _ = run_hooks_impl(
+                let stats = run_cron_tick(
                     &hooks,
                     &workspace_root,
                     &session_id,
-                    "cron_tick",
-                    &serde_json::json!({
-                        "trigger": "watch",
-                        "tick_at": now_stamp(),
-                    }),
-                    false,
+                    template_name,
+                    "watch",
+                    true,
+                    verbose,
                 )?;
-                std::thread::sleep(Duration::from_secs(60));
+                if verbose {
+                    println!(
+                        "{} {} ran={}, skipped={}, success={}, failed={}, total={}ms",
+                        c24("[cron]", 120, 180, 255),
+                        c24("iteration summary:", 200, 210, 220),
+                        c24(&stats.hooks_ran.to_string(), 160, 200, 255),
+                        c24(&stats.hooks_skipped.to_string(), 160, 200, 255),
+                        c24(&stats.hooks_success.to_string(), 110, 220, 140),
+                        c24(&stats.hooks_failed.to_string(), 255, 120, 120),
+                        c24(&stats.elapsed_ms.to_string(), 180, 180, 255),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(cron_interval_ms));
             }
         }
-        _ => Err(anyhow!("usage: wasm1 cron [once|watch] [-t <template>]")),
+        _ => Err(anyhow!("usage: wasm1 cron [once|watch] [-t <template>] [-v]")),
     }
+}
+
+fn cron_state_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(".agent/cron/state.yaml")
+}
+
+fn load_cron_state(workspace_root: &Path) -> Result<HashMap<String, serde_json::Map<String, serde_json::Value>>> {
+    let path = cron_state_path(workspace_root);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("invalid cron state path"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read cron state: {}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(HashMap::new());
+    }
+    let yaml_val: serde_yaml::Value = serde_yaml::from_str(&text)
+        .with_context(|| format!("failed to parse cron state YAML: {}", path.display()))?;
+    let json_val = serde_json::to_value(yaml_val).context("failed to convert cron state YAML to JSON")?;
+    let mut out: HashMap<String, serde_json::Map<String, serde_json::Value>> = HashMap::new();
+    if let Some(obj) = json_val.as_object() {
+        for (k, v) in obj {
+            if let Some(entry_obj) = v.as_object() {
+                out.insert(k.clone(), entry_obj.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn save_cron_state(
+    workspace_root: &Path,
+    state: &HashMap<String, serde_json::Map<String, serde_json::Value>>,
+) -> Result<()> {
+    let mut root = serde_json::Map::new();
+    for (k, v) in state {
+        root.insert(k.clone(), serde_json::Value::Object(v.clone()));
+    }
+    let yaml = serde_yaml::to_string(&serde_json::Value::Object(root))
+        .context("failed to serialize cron state")?;
+    fs::write(cron_state_path(workspace_root), yaml).context("failed to write cron state")
+}
+
+fn value_as_i64(value: &serde_json::Value) -> Option<i64> {
+    if let Some(v) = value.as_i64() {
+        return Some(v);
+    }
+    if let Some(v) = value.as_u64() {
+        return i64::try_from(v).ok();
+    }
+    if let Some(v) = value.as_f64() {
+        return Some(v as i64);
+    }
+    if let Some(s) = value.as_str() {
+        return s.trim().parse::<i64>().ok();
+    }
+    None
+}
+
+fn resolve_cron_agent_name(hook: &HookDef, template_name: Option<&str>) -> String {
+    for job in hook.jobs.values() {
+        for step in &job.steps {
+            if step.step_type == "llm" {
+                if let Some(t) = step.template.as_deref() {
+                    if !t.trim().is_empty() {
+                        return t.trim().to_string();
+                    }
+                }
+            }
+        }
+    }
+    template_name
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "global".to_string())
+}
+
+fn apply_cron_schedule_from_output(
+    output: Option<&str>,
+    now_ms: u64,
+    entry: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let mut computed_next_run: Option<i64> = None;
+    if let Some(raw) = output {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+            if let Some(obj) = value.as_object() {
+                for (k, v) in obj {
+                    entry.insert(k.clone(), v.clone());
+                }
+                if let Some(ms_rel) = obj.get("nextRunInMs").and_then(value_as_i64) {
+                    let next = now_ms as i64 + ms_rel.max(0);
+                    computed_next_run = Some(next);
+                    entry.insert("nextRunAt".to_string(), serde_json::json!(next));
+                } else if let Some(abs) = obj.get("nextRunAt").and_then(value_as_i64) {
+                    computed_next_run = Some(abs.max(0));
+                    entry.insert("nextRunAt".to_string(), serde_json::json!(abs.max(0)));
+                }
+            }
+        }
+    }
+    if computed_next_run.is_none() && !entry.contains_key("nextRunAt") {
+        entry.insert("nextRunAt".to_string(), serde_json::json!(0));
+    }
+}
+
+fn run_cron_tick(
+    hooks: &[HookDef],
+    workspace_root: &Path,
+    session_id: &str,
+    template_name: Option<&str>,
+    trigger: &str,
+    respect_schedule: bool,
+    verbose: bool,
+) -> Result<CronIterationStats> {
+    let tick_started = Instant::now();
+    let base_tick = now_millis();
+    let mut stats = CronIterationStats::default();
+
+    for hook in hooks.iter().filter(|h| h.on == "cron_tick") {
+        let enabled = hook.enabled.unwrap_or(true);
+        if !enabled {
+            stats.hooks_skipped += 1;
+            if verbose {
+                println!(
+                    "{} {} {} ({})",
+                    c24("[cron]", 120, 180, 255),
+                    c24("SKIP", 255, 160, 100),
+                    hook.name,
+                    c24("disabled", 255, 160, 100)
+                );
+            }
+            continue;
+        }
+
+        let cron_state = load_cron_state(workspace_root)?;
+        let agent_name = resolve_cron_agent_name(hook, template_name);
+        let state_key = format!("{}:{}", agent_name, hook.name);
+        let existing_entry = cron_state
+            .get(&state_key)
+            .cloned()
+            .unwrap_or_default();
+
+        let next_run_at = existing_entry
+            .get("nextRunAt")
+            .and_then(value_as_i64)
+            .unwrap_or(0);
+
+        if respect_schedule && next_run_at > base_tick as i64 {
+            stats.hooks_skipped += 1;
+            if verbose {
+                let wait_ms = next_run_at.saturating_sub(base_tick as i64);
+                println!(
+                    "{} {} {} ({})",
+                    c24("[cron]", 120, 180, 255),
+                    c24("SKIP", 255, 200, 120),
+                    hook.name,
+                    c24(&format!("nextRunAt in {wait_ms}ms"), 255, 200, 120)
+                );
+            }
+            continue;
+        }
+
+        let mut payload = serde_json::json!({
+            "trigger": trigger,
+            "tick_at": now_stamp(),
+            "cron": {
+                "stateKey": state_key,
+                "nowMs": base_tick,
+                "state": serde_json::Value::Object(existing_entry.clone()),
+            }
+        });
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("agent_name".to_string(), serde_json::json!(agent_name));
+            obj.insert("hook_name".to_string(), serde_json::json!(hook.name.clone()));
+        }
+
+        let mut base = serde_json::json!({
+            "hook": "cron_tick",
+            "session_id": session_id,
+            "timestamp": now_stamp(),
+            "agent_id": "main",
+            "workspace": workspace_root.display().to_string(),
+        });
+        merge_json_object(&mut base, &payload);
+
+        if !hook_matches(hook, &base) {
+            continue;
+        }
+
+        let hook_started = Instant::now();
+        stats.hooks_ran += 1;
+        let run = execute_hook_collect(hook, &base, workspace_root);
+        match run {
+            Ok(run_result) => {
+                let mut latest_state = load_cron_state(workspace_root)?;
+                let mut entry = existing_entry;
+                entry.insert("lastRunAt".to_string(), serde_json::json!(now_millis()));
+                apply_cron_schedule_from_output(run_result.last_llm_output.as_deref(), now_millis(), &mut entry);
+                latest_state.insert(state_key, entry);
+                save_cron_state(workspace_root, &latest_state)?;
+                let elapsed = hook_started.elapsed().as_millis();
+                if let Some(reason) = run_result.blocked_reason {
+                    stats.hooks_failed += 1;
+                    eprintln!("[HOOK:{}] blocked: {reason}", hook.name);
+                    if verbose {
+                        println!(
+                            "{} {} {} ({}; {}ms)",
+                            c24("[cron]", 120, 180, 255),
+                            c24("RUN", 140, 220, 255),
+                            hook.name,
+                            c24("blocked", 255, 160, 100),
+                            elapsed
+                        );
+                    }
+                } else {
+                    stats.hooks_success += 1;
+                    if verbose {
+                        println!(
+                            "{} {} {} ({}; {}ms)",
+                            c24("[cron]", 120, 180, 255),
+                            c24("RUN", 140, 220, 255),
+                            hook.name,
+                            c24("success", 110, 220, 140),
+                            elapsed
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                let mut latest_state = load_cron_state(workspace_root)?;
+                eprintln!("[HOOK:{}] error: {err}", hook.name);
+                let mut entry = existing_entry;
+                entry.insert("lastRunAt".to_string(), serde_json::json!(now_millis()));
+                latest_state.insert(state_key, entry);
+                save_cron_state(workspace_root, &latest_state)?;
+                stats.hooks_failed += 1;
+                if verbose {
+                    println!(
+                        "{} {} {} ({}; {}ms)",
+                        c24("[cron]", 120, 180, 255),
+                        c24("RUN", 140, 220, 255),
+                        hook.name,
+                        c24("failed", 255, 120, 120),
+                        hook_started.elapsed().as_millis()
+                    );
+                }
+            }
+        }
+    }
+
+    stats.elapsed_ms = tick_started.elapsed().as_millis();
+    Ok(stats)
 }
 
 fn read_hooks_from_template_file(path: &Path) -> Result<Vec<HookDef>> {
@@ -1667,8 +2073,17 @@ fn hook_matches(hook: &HookDef, payload: &serde_json::Value) -> bool {
 }
 
 fn execute_hook(hook: &HookDef, payload: &serde_json::Value, workspace_root: &Path) -> Result<Option<String>> {
+    Ok(execute_hook_collect(hook, payload, workspace_root)?.blocked_reason)
+}
+
+fn execute_hook_collect(
+    hook: &HookDef,
+    payload: &serde_json::Value,
+    workspace_root: &Path,
+) -> Result<HookRunResult> {
     let mut completed: HashMap<String, ()> = HashMap::new();
     let mut outputs: HashMap<String, String> = HashMap::new();
+    let mut last_llm_output: Option<String> = None;
 
     while completed.len() < hook.jobs.len() {
         let mut progressed = false;
@@ -1695,7 +2110,13 @@ fn execute_hook(hook: &HookDef, payload: &serde_json::Value, workspace_root: &Pa
                 let parsed: serde_json::Value = serde_json::from_str(&step_out).unwrap_or(serde_json::Value::Null);
                 if parsed["blocked"].as_bool().unwrap_or(false) {
                     let reason = parsed["reason"].as_str().unwrap_or("blocked by hook").to_string();
-                    return Ok(Some(reason));
+                    return Ok(HookRunResult {
+                        blocked_reason: Some(reason),
+                        last_llm_output,
+                    });
+                }
+                if step.step_type == "llm" {
+                    last_llm_output = Some(step_out);
                 }
             }
             let _ = job_outputs;
@@ -1707,7 +2128,10 @@ fn execute_hook(hook: &HookDef, payload: &serde_json::Value, workspace_root: &Pa
         }
     }
 
-    Ok(None)
+    Ok(HookRunResult {
+        blocked_reason: None,
+        last_llm_output,
+    })
 }
 
 fn execute_hook_step(
