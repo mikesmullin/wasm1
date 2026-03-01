@@ -30,8 +30,16 @@ spec:
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `description` | string | no | Human-friendly description. |
-| `model` | string | no | Provider-prefixed model string, e.g. `xai:grok-4-fast-reasoning`. |
-| `context_window` | number | no | Context window size in tokens. Known xAI models are resolved automatically from a built-in table; set this only for unlisted or custom models. Used to display `[CTX]` usage percentages. |
+| `model` | string | no | Provider-prefixed model string, e.g. `xai:grok-4-fast-reasoning` or `copilot:gpt-4o`. If omitted, host falls back to `XAI_MODEL` then built-in default. |
+| `context_window` | number | no | Context window size in tokens. Known xAI models are resolved automatically from a built-in table; Copilot models currently require this field for explicit window reporting. Used to display `[CTX]` usage percentages. |
+
+### Provider auth environment variables
+
+- `xai:*` models require `XAI_API_KEY`.
+- `copilot:*` models require either:
+  - `GITHUB_COPILOT_API_TOKEN` and optional `COPILOT_API_URL`, or
+  - `COPILOT_TOKEN` (or `COPILOT_API_KEY`) and optional `COPILOT_API_URL`, or
+  - `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN` (host exchanges it for a Copilot session token).
 | `labels` | string[] | no | Optional tags for discovery and filtering. |
 | `hooks` | array | no | Template-local hooks merged with repo/user hooks. See [HOOKS.md](HOOKS.md). |
 | `validate` | string | no | JavaScript validation function body run against the final assistant reply (`reply` arg). Must return truthy to accept. |

@@ -1,6 +1,6 @@
 # wasm1 — Wasmtime AI Agent Sandbox
 
-A Rust proof-of-concept for running an **xAI Grok-powered AI agent** inside a **Wasmtime WebAssembly sandbox**, with tool calling, an in-guest JavaScript runtime, and a copy-on-write virtual filesystem.
+A Rust proof-of-concept for running an AI agent (xAI + Copilot providers) inside a **Wasmtime WebAssembly sandbox**, with tool calling, an in-guest JavaScript runtime, and a copy-on-write virtual filesystem.
 
 The agent loop runs entirely inside a `.wasm` guest module. All privileged operations — LLM inference, code execution, filesystem access — are mediated through **explicit host functions**. The API token never enters guest memory.
 
@@ -13,14 +13,14 @@ The agent loop runs entirely inside a `.wasm` guest module. All privileged opera
 │  Host Process  (Rust)                                       │
 │                                                             │
 │  HostState                                                  │
-│  ├── XAI API key          (never crosses into guest)        │
-│  ├── reqwest HTTP client  (for Grok API calls)              │
+│  ├── Provider auth token  (never crosses into guest)         │
+│  ├── reqwest HTTP client  (for xAI/Copilot chat API calls)   │
 │  ├── tcow_path            path to agent.tcow on disk        │
 │  └── pending_writes       buffered VFS writes (flushed on exit)│
 │                                                             │
 │  Linker — host functions exposed to guest:                  │
 │  ├── host::get_prompt     read the initial prompt           │
-│  ├── host::grok_chat      call xAI Grok for inference       │
+│  ├── host::grok_chat      call selected provider inference   │
 │  ├── host::host_log       write a log line to host stdout   │
 │  ├── host::emit_final     emit the agent's final answer     │
 │  ├── host::fs_read        read a file from agent.tcow       │
@@ -59,7 +59,7 @@ All host functions use a simple `i32` ABI (pointer + length pairs, return value 
 | Function | Description |
 |---|---|
 | `get_prompt` | Returns the CLI prompt string to the guest |
-| `grok_chat(req_json)` | Sends a chat request to xAI Grok, returns LLM decision JSON |
+| `grok_chat(req_json)` | Sends a chat request to the active provider (`xai` or `copilot`), returns LLM decision JSON |
 | `host_log(msg)` | Emits a prefixed log line to host stdout |
 | `emit_final(answer)` | Signals the agent's final answer to the host |
 | `fs_read(path)` | Reads a file from the virtual `.tcow` filesystem (union view across all layers) |
@@ -83,7 +83,7 @@ Virtual filesystem access is exposed to JS code via Boa native objects that call
 
 ## Security Model
 
-- The xAI API key lives **only in the host process** (env var / `.env` file). It is never written into guest linear memory.
+- Provider auth tokens live **only in the host process** (env vars / `.env` file). They are never written into guest linear memory.
 - The guest has **no ambient WASI authority** — no direct filesystem or network access. Everything goes through named host functions that the host explicitly registers.
 - JavaScript execution runs inside **[Boa](https://github.com/boa-dev/boa)**, a pure-Rust ES2020 interpreter compiled directly into the guest `.wasm` binary. It has no access to the host filesystem, network, or any WASI capability — only what the Boa `Context` explicitly provides.
 - Virtual filesystem access is scoped to the `.tcow` virtual FS. The `fs_*` host functions are registered in the Wasmtime linker, but JS code reaches them only through Boa native object wrappers (`fs.readFile`, `fs.writeFile`, `fs.readdir`, `require`). The real host filesystem is not reachable from JS. All writes are buffered in-process and flushed as a new delta layer to `agent.tcow` on clean exit, providing a persistent, auditable record across runs.
@@ -93,7 +93,10 @@ Virtual filesystem access is exposed to JS code via Boa native objects that call
 
 ## Building
 
-**Prerequisites:** Rust stable, `wasm32-wasip1` target, an `XAI_API_KEY` env var.
+**Prerequisites:** Rust stable, `wasm32-wasip1` target, and provider auth:
+
+- xAI: `XAI_API_KEY`
+- Copilot: `COPILOT_API_KEY`
 
 ```bash
 # Add the Wasm target (once)
@@ -102,8 +105,12 @@ rustup target add wasm32-wasip1
 # Build the guest module
 cargo build --manifest-path guest/Cargo.toml --target wasm32-wasip1
 
-# Build and run the host
+# Build and run the host (xAI default model)
 XAI_API_KEY=your_key cargo run -- "What is the capital of Japan?"
+
+# Build and run with a Copilot-prefixed template model
+# (template metadata.model: copilot:gpt-4o)
+GITHUB_TOKEN=your_github_token cargo run -- -t your-template "Summarize this repository"
 ```
 
 The host automatically rebuilds the guest if `guest/target/wasm32-wasip1/debug/guest.wasm` is stale. The virtual filesystem is stored in `agent.tcow` (path overridable via `TCOW_PATH` env var); it is created on the first write and extended with a new delta layer on each subsequent run.

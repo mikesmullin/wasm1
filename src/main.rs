@@ -24,6 +24,12 @@ const DEFAULT_CRON_INTERVAL_MS: u64 = 60_000;
 const SHELL_TIMEOUT_DEFAULT: Option<u64> = None;
 static MSG_ID_SEQ: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelProvider {
+    Xai,
+    Copilot,
+}
+
 // ── Template YAML structs ─────────────────────────────────────────────────────
 #[derive(Debug, Deserialize, Default)]
 struct Template {
@@ -212,6 +218,11 @@ struct HostState {
     prompt: String,
     final_answer: Option<String>,
     api_key: String,
+    provider: ModelProvider,
+    /// Provider-native model name (without optional provider prefix).
+    model_name: String,
+    /// Base URL used by provider APIs.
+    provider_api_url: String,
     model: String,
     client: Client,
     wasi: WasiCtx,
@@ -325,7 +336,7 @@ fn resolve_template(name: &str) -> Result<PathBuf> {
     ))
 }
 
-fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>, Option<u32>, Option<String>, Option<u32>, Vec<String>, Option<u64>, Vec<HookDef>, Option<String>, Vec<String>)> {
+fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>, Option<u32>, Option<String>, Option<u32>, Vec<String>, Option<u64>, Vec<HookDef>, Option<String>, Vec<String>, Option<String>)> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read template: {}", path.display()))?;
     let template: Template = serde_yaml::from_str(&content)
@@ -392,15 +403,21 @@ fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>
         .metadata
         .as_ref()
         .and_then(|m| m.description.clone());
+    let template_model = template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.model.clone())
+        .filter(|m| !m.trim().is_empty());
     let tools = template
         .metadata
         .as_ref()
         .and_then(|m| m.tools.clone())
         .unwrap_or_else(all_tool_names);
     println!(
-        "[HOST] Template loaded: {} shell allow-list entries, timeout: {}, system_prompt: {}, max_steps: {}, validate: {}, max_validation_fails: {}, tools: [{}], hooks: {}, labels: {}, context_window: {}",
+        "[HOST] Template loaded: {} shell allow-list entries, timeout: {}, model: {}, system_prompt: {}, max_steps: {}, validate: {}, max_validation_fails: {}, tools: [{}], hooks: {}, labels: {}, context_window: {}",
         regexes.len(),
         timeout.map(|t| format!("{t}s")).unwrap_or_else(|| "indefinite".into()),
+        template_model.clone().unwrap_or_else(|| "unset".into()),
         system_prompt.as_deref().map(|s| format!("{} chars", s.len())).unwrap_or_else(|| "none".into()),
         max_steps.map(|n| n.to_string()).unwrap_or_else(|| "indefinite".into()),
         if validate_fn.is_some() { "yes" } else { "no" },
@@ -412,7 +429,22 @@ fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>
         labels.len(),
         template_context_window.map(|n| format!("{n}")).unwrap_or_else(|| "unset".into()),
     );
-    Ok((regexes, timeout, system_prompt, max_steps, validate_fn, max_validation_fails, tools, template_context_window, hooks, description, labels))
+    Ok((regexes, timeout, system_prompt, max_steps, validate_fn, max_validation_fails, tools, template_context_window, hooks, description, labels, template_model))
+}
+
+fn parse_provider_model(raw_model: &str) -> (ModelProvider, String) {
+    if let Some(name) = raw_model.strip_prefix("copilot:") {
+        return (ModelProvider::Copilot, name.to_string());
+    }
+    if let Some(name) = raw_model.strip_prefix("xai:") {
+        return (ModelProvider::Xai, name.to_string());
+    }
+    (ModelProvider::Xai, raw_model.to_string())
+}
+
+fn resolve_copilot_github_token() -> Result<String> {
+    env::var("COPILOT_API_KEY")
+        .context("copilot provider requires COPILOT_API_KEY")
 }
 
 /// Query the xAI models endpoint to discover the context window for `model`.
@@ -495,26 +527,41 @@ fn main() -> Result<()> {
         prompt.ok_or_else(|| anyhow!("usage: cargo run -- [clean|cron <once|watch>|-t <template>] \"<prompt>\""))?;
 
     // Load template allow-list if -t was supplied
-    let (shell_allow, shell_timeout, system_prompt, max_steps, validate_fn, max_validation_fails, enabled_tools, template_context_window, template_hooks, template_description, template_labels) = if let Some(ref name) = template_name {
+    let (shell_allow, shell_timeout, system_prompt, max_steps, validate_fn, max_validation_fails, enabled_tools, template_context_window, template_hooks, template_description, template_labels, template_model) = if let Some(ref name) = template_name {
         let path = resolve_template(name)?;
         println!("[HOST] Using template: {}", path.display());
         load_template(&path)?
     } else {
-        (Vec::new(), SHELL_TIMEOUT_DEFAULT, None, None, None, None, all_tool_names(), None, Vec::new(), None, Vec::new())
+        (Vec::new(), SHELL_TIMEOUT_DEFAULT, None, None, None, None, all_tool_names(), None, Vec::new(), None, Vec::new(), None)
     };
     let effective_hooks = merge_hooks(load_global_hooks()?, template_hooks);
     println!("[HOST] Hooks loaded: {}", effective_hooks.len());
 
     println!("[HOST] Starting agent with prompt: {:?}", prompt);
 
-    let api_key = env::var("XAI_API_KEY")
-        .context("XAI_API_KEY is required (set it in environment or .env)")?;
-    let model = env::var("XAI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let model = template_model
+        .or_else(|| env::var("XAI_MODEL").ok())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let client = Client::new();
-    let context_window = lookup_model_context_window(&model)
-        .or(template_context_window);
+    let (provider, model_name) = parse_provider_model(&model);
+    let (api_key, provider_api_url, context_window) = match provider {
+        ModelProvider::Xai => {
+            let key = env::var("XAI_API_KEY")
+                .context("xai provider requires XAI_API_KEY (set it in environment or .env)")?;
+            let ctx = lookup_model_context_window(&model).or(template_context_window);
+            (key, "https://api.x.ai".to_string(), ctx)
+        }
+        ModelProvider::Copilot => {
+            let token = resolve_copilot_github_token()?;
+            (token, "https://models.github.ai".to_string(), template_context_window)
+        }
+    };
+    let provider_name = match provider {
+        ModelProvider::Xai => "xai",
+        ModelProvider::Copilot => "copilot",
+    };
     println!(
-        "[HOST] Model: {model} | API key: loaded | context_window: {}",
+        "[HOST] Provider: {provider_name} | Model: {model} (native={model_name}) | Auth: loaded | context_window: {}",
         context_window.map(|n| format!("{n} tokens")).unwrap_or_else(|| "unknown (set metadata.context_window in template)".into()),
     );
 
@@ -1335,6 +1382,9 @@ fn main() -> Result<()> {
         prompt,
         final_answer: None,
         api_key,
+        provider,
+        model_name,
+        provider_api_url,
         model,
         client,
         wasi,
@@ -3096,8 +3146,24 @@ fn format_tool_result(result_json: &str) -> String {
     }
 }
 
+fn normalize_copilot_model_id(model_name: &str) -> String {
+    if model_name.contains('/') {
+        model_name.to_string()
+    } else {
+        format!("openai/{model_name}")
+    }
+}
+
+fn usage_thought_tokens(usage: &serde_json::Value) -> u64 {
+    usage["thought_tokens"].as_u64()
+        .or_else(|| usage["reasoning_tokens"].as_u64())
+        .or_else(|| usage["completion_tokens_details"]["reasoning_tokens"].as_u64())
+        .or_else(|| usage["output_tokens_details"]["reasoning_tokens"].as_u64())
+        .unwrap_or(0)
+}
+
 fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
-    // Build native xAI tool definitions
+    // Build provider-compatible tool definitions
     let tools_json_str = build_tools_json(&state.enabled_tools);
     let tools_value: serde_json::Value = serde_json::from_str(&tools_json_str)
         .unwrap_or(serde_json::json!([]));
@@ -3131,24 +3197,46 @@ fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
         }));
     }
 
+    let request_model = if state.provider == ModelProvider::Copilot {
+        normalize_copilot_model_id(&state.model_name)
+    } else {
+        state.model_name.clone()
+    };
+
     let body = serde_json::json!({
-        "model": state.model,
+        "model": request_model,
         "temperature": 0.1,
         "messages": messages,
         "tools": tools_value,
         "tool_choice": "auto",
     });
 
+    let (chat_url, provider_label) = match state.provider {
+        ModelProvider::Xai => (
+            format!("{}/v1/chat/completions", state.provider_api_url.trim_end_matches('/')),
+            "xAI",
+        ),
+        ModelProvider::Copilot => (
+            format!("{}/inference/chat/completions", state.provider_api_url.trim_end_matches('/')),
+            "Copilot",
+        ),
+    };
+
     let mut last_timeout_err: Option<reqwest::Error> = None;
     let mut resp_opt = None;
+    let req_started = Instant::now();
     for attempt in 1..=3 {
-        match state
+        let mut req_builder = state
             .client
-            .post("https://api.x.ai/v1/chat/completions")
+            .post(&chat_url)
             .bearer_auth(&state.api_key)
-            .json(&body)
-            .send()
-        {
+            .json(&body);
+        if state.provider == ModelProvider::Copilot {
+            req_builder = req_builder
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28");
+        }
+        match req_builder.send() {
             Ok(resp) => {
                 resp_opt = Some(resp);
                 break;
@@ -3156,7 +3244,7 @@ fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
             Err(err) if err.is_timeout() && attempt < 3 => {
                 let backoff_ms = 500_u64 * (1_u64 << (attempt - 1));
                 eprintln!(
-                    "[HOST] xAI request timed out (attempt {attempt}/3); retrying in {backoff_ms}ms"
+                    "[HOST] {provider_label} request timed out (attempt {attempt}/3); retrying in {backoff_ms}ms"
                 );
                 std::thread::sleep(Duration::from_millis(backoff_ms));
                 last_timeout_err = Some(err);
@@ -3166,7 +3254,7 @@ fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
                 break;
             }
             Err(err) => {
-                return Err(anyhow!(err).context("request to xAI failed"));
+                return Err(anyhow!(err).context(format!("request to {provider_label} failed")));
             }
         }
     }
@@ -3176,27 +3264,72 @@ fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
             let err = last_timeout_err
                 .map(anyhow::Error::new)
                 .unwrap_or_else(|| anyhow!("request timed out"));
-            return Err(err.context("request to xAI failed after 3 timeout retries"));
+            return Err(err.context(format!("request to {provider_label} failed after 3 timeout retries")));
         }
     };
 
     let status = resp.status();
-    let payload: serde_json::Value = resp.json().context("failed to parse xAI response JSON")?;
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("(unknown)")
+        .to_string();
+    let body_text = resp
+        .text()
+        .with_context(|| format!("failed to read {provider_label} response body"))?;
     if !status.is_success() {
-        return Err(anyhow!("xAI API error {status}: {payload}"));
+        return Err(anyhow!(
+            "{provider_label} API error {status} (content-type: {content_type}): {body}",
+            body = body_text.chars().take(600).collect::<String>()
+        ));
     }
+    let payload: serde_json::Value = serde_json::from_str(&body_text).with_context(|| {
+        format!(
+            "failed to parse {provider_label} response JSON (content-type: {content_type}, body-prefix: {prefix})",
+            prefix = body_text.chars().take(220).collect::<String>().replace('\n', "\\n")
+        )
+    })?;
 
     // Print context window usage for this step
     {
         let u = &payload["usage"];
         let prompt     = u["prompt_tokens"].as_u64().unwrap_or(0);
         let completion = u["completion_tokens"].as_u64().unwrap_or(0);
+        let thought    = usage_thought_tokens(u);
         let total      = u["total_tokens"].as_u64().unwrap_or(prompt + completion);
         if let Some(window) = state.context_window {
             let pct = total * 100 / window.max(1);
             println!("[CTX] step={} {total}/{window} tokens ({pct}%)  [prompt={prompt} completion={completion}]", req.step);
         } else {
             println!("[CTX] step={} prompt={prompt} completion={completion} total={total}", req.step);
+        }
+
+        let elapsed = req_started.elapsed().as_secs_f64();
+        let safe_elapsed = elapsed.max(0.001);
+        let tok_per_sec = completion as f64 / safe_elapsed;
+        let output_tokens = completion + thought;
+        if thought > 0 {
+            println!(
+                "[PERF] step={} {:.2} tok/s elapsed={:.2}s [completion={} thought={} output={} total={}]",
+                req.step,
+                tok_per_sec,
+                elapsed,
+                completion,
+                thought,
+                output_tokens,
+                total,
+            );
+        } else {
+            println!(
+                "[PERF] step={} {:.2} tok/s elapsed={:.2}s [completion={} output={} total={}]",
+                req.step,
+                tok_per_sec,
+                elapsed,
+                completion,
+                output_tokens,
+                total,
+            );
         }
     }
 
