@@ -1,0 +1,3 @@
+[submodule "vendor/tcow"]
+	path = vendor/tcow
+	url = git@github.com:mikesmullin/tcow.git
