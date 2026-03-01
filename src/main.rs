@@ -1,10 +1,15 @@
 use anyhow::{anyhow, Context, Result};
 use dotenvy::from_filename;
+use regex::Regex;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
+use std::collections::HashMap;
 use std::env;
-use std::path::Path;
-use std::process::Command;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tcow::TcowFile;
 use wasmtime::{Caller, Config, Engine, Linker, Module, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, add_to_linker as wasi_add_to_linker};
@@ -12,6 +17,53 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, add_to_linker as wasi_add_to_linker
 const DEFAULT_MODEL: &str = "grok-4-1-fast-reasoning";
 const GUEST_WASM_PATH: &str = "guest/target/wasm32-wasip1/debug/guest.wasm";
 const FUEL_LIMIT: u64 = 2_000_000_000;
+/// `None` = wait indefinitely (default when no template or template omits timeout_secs).
+const SHELL_TIMEOUT_DEFAULT: Option<u64> = None;
+
+// ── Template YAML structs ─────────────────────────────────────────────────────
+#[derive(Debug, Deserialize, Default)]
+struct Template {
+    metadata: Option<TemplateMetadata>,
+    #[allow(dead_code)]
+    spec: Option<TemplateSpec>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct TemplateMetadata {
+    #[allow(dead_code)]
+    description: Option<String>,
+    #[allow(dead_code)]
+    model: Option<String>,
+    shell: Option<ShellConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ShellConfig {
+    allow: Option<Vec<String>>,
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
+struct TemplateSpec {
+    system_prompt: Option<String>,
+}
+
+// ── Shell output YAML ─────────────────────────────────────────────────────────
+#[derive(Debug, Serialize)]
+struct ShellOut {
+    pid: u32,
+    status: String,
+    cmd: String,
+    args: Vec<String>,
+    started_ms: u64,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_secs: Option<u64>,
+}
 
 struct HostState {
     prompt: String,
@@ -24,6 +76,13 @@ struct HostState {
     tcow_path: String,
     /// Writes buffered in memory during this run; flushed after guest returns.
     pending_writes: Vec<(String, Vec<u8>)>,
+    /// Compiled allow-list from template metadata.shell.allow.
+    /// Empty vec = all shell commands denied.
+    shell_allow: Vec<Regex>,
+    /// Wall-clock timeout for shell commands; `None` = wait indefinitely.
+    shell_timeout: Option<u64>,
+    /// Live child processes spawned this session, keyed by PID.
+    running_processes: HashMap<u32, Child>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,12 +138,88 @@ struct ChatChoiceMessage {
     content: String,
 }
 
+fn resolve_template(name: &str) -> Result<PathBuf> {
+    let p = Path::new(name);
+    if p.is_absolute() {
+        if p.exists() {
+            return Ok(p.to_path_buf());
+        } else {
+            return Err(anyhow!("template not found: {name}"));
+        }
+    }
+    let basename = if name.ends_with(".yaml") {
+        name.to_string()
+    } else {
+        format!("{name}.yaml")
+    };
+    let home = env::var("HOME").unwrap_or_default();
+    let candidates = [
+        PathBuf::from(".agent/templates").join(&basename),
+        PathBuf::from(&home)
+            .join(".config/daemon/agent/templates")
+            .join(&basename),
+    ];
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Ok(candidate.clone());
+        }
+    }
+    Err(anyhow!(
+        "template '{name}' not found in .agent/templates/ or ~/.config/daemon/agent/templates/"
+    ))
+}
+
+fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>)> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read template: {}", path.display()))?;
+    let template: Template = serde_yaml::from_str(&content)
+        .with_context(|| format!("failed to parse template YAML: {}", path.display()))?;
+    let shell_cfg = template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.shell.as_ref());
+    let allow_patterns = shell_cfg
+        .and_then(|s| s.allow.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let timeout = shell_cfg.and_then(|s| s.timeout_secs);
+    let regexes = allow_patterns
+        .iter()
+        .map(|pat| Regex::new(pat).with_context(|| format!("invalid regex in template: {pat}")))
+        .collect::<Result<Vec<_>>>()?;
+    println!(
+        "[HOST] Template loaded: {} shell allow-list entries, timeout: {}",
+        regexes.len(),
+        timeout.map(|t| format!("{t}s")).unwrap_or_else(|| "indefinite".into())
+    );
+    Ok((regexes, timeout))
+}
+
 fn main() -> Result<()> {
     let _ = from_filename(".env");
 
-    let prompt = env::args()
-        .nth(1)
-        .ok_or_else(|| anyhow!("usage: cargo run -- \"<prompt>\""))?;
+    // Parse CLI args: [-t <template>] <prompt>
+    let mut args_iter = env::args().skip(1);
+    let mut template_name: Option<String> = None;
+    let mut prompt: Option<String> = None;
+    while let Some(arg) = args_iter.next() {
+        if arg == "-t" || arg == "--template" {
+            template_name = args_iter.next();
+        } else {
+            prompt = Some(arg);
+        }
+    }
+    let prompt =
+        prompt.ok_or_else(|| anyhow!("usage: cargo run -- [-t <template>] \"<prompt>\""))?;
+
+    // Load template allow-list if -t was supplied
+    let (shell_allow, shell_timeout) = if let Some(ref name) = template_name {
+        let path = resolve_template(name)?;
+        println!("[HOST] Using template: {}", path.display());
+        load_template(&path)?
+    } else {
+        (Vec::new(), SHELL_TIMEOUT_DEFAULT)
+    };
 
     println!("[HOST] Starting agent with prompt: {:?}", prompt);
 
@@ -314,12 +449,279 @@ fn main() -> Result<()> {
         },
     )?;
 
+    // ── shell_run ─────────────────────────────────────────────────────────────
+    linker.func_wrap(
+        "host",
+        "shell_run",
+        |mut caller: Caller<'_, HostState>,
+         cmd_ptr: i32,
+         cmd_len: i32,
+         args_ptr: i32,
+         args_len: i32,
+         out_ptr: i32,
+         out_cap: i32|
+         -> i32 {
+            let cmd = match read_memory(&mut caller, cmd_ptr, cmd_len) {
+                Ok(c) => c,
+                Err(_) => return -3,
+            };
+            let args_json = match read_memory(&mut caller, args_ptr, args_len) {
+                Ok(j) => j,
+                Err(_) => return -3,
+            };
+            let args: Vec<String> =
+                serde_json::from_str(&args_json).unwrap_or_default();
+
+            // Allow-list check
+            let full_cmd = if args.is_empty() {
+                cmd.clone()
+            } else {
+                format!("{cmd} {}", args.join(" "))
+            };
+            let allowed = caller
+                .data()
+                .shell_allow
+                .iter()
+                .any(|re| re.is_match(&full_cmd));
+            if !allowed {
+                println!(
+                    "[HOST] shell_run: command denied by allow-list: {full_cmd:?}"
+                );
+                return -1;
+            }
+
+            // Generate output path
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let hash_input = format!("{full_cmd}\t{now_ms}");
+            let mut hasher = Sha1::new();
+            hasher.update(hash_input.as_bytes());
+            let sha_bytes = hasher.finalize();
+            let sha_hex: String =
+                sha_bytes.iter().take(3).map(|b| format!("{b:02x}")).collect();
+            // Store in virtual FS under "tmp/..." (leading slash stripped)
+            let vfs_path = format!("tmp/{}_{}.out", now_ms, sha_hex);
+            let guest_path = format!("/tmp/{}_{}.out", now_ms, sha_hex);
+
+            // Write initial YAML to pending_writes
+            let initial = ShellOut {
+                pid: 0,
+                status: "running".into(),
+                cmd: cmd.clone(),
+                args: args.clone(),
+                started_ms: now_ms,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                elapsed_ms: None,
+                timeout_secs: None,
+            };
+            let initial_yaml = serde_yaml::to_string(&initial)
+                .unwrap_or_else(|_| "status: running\n".into());
+            caller
+                .data_mut()
+                .pending_writes
+                .push((vfs_path.clone(), initial_yaml.into_bytes()));
+
+            println!("[HOST] shell_run: spawning {:?} {:?}", cmd, args);
+            let start = Instant::now();
+
+            // Spawn child
+            let child_result = Command::new(&cmd)
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+
+            let child = match child_result {
+                Err(e) => {
+                    println!("[HOST] shell_run: spawn failed: {e}");
+                    return -2;
+                }
+                Ok(c) => c,
+            };
+
+            let pid = child.id();
+            // Register in session for shell_stdin / shell_kill
+            caller.data_mut().running_processes.insert(pid, child);
+            // Take it back out to wait (single-threaded: nothing else running)
+            let mut child = caller
+                .data_mut()
+                .running_processes
+                .remove(&pid)
+                .unwrap();
+
+            // Wait for process, with optional timeout
+            let shell_timeout = caller.data().shell_timeout;
+            drop(child.stdin.take()); // close stdin so child isn't waiting on input
+
+            let output_result = std::thread::scope(|s| {
+                let handle = s.spawn(|| child.wait_with_output());
+                let wait_start = Instant::now();
+                loop {
+                    if handle.is_finished() {
+                        return handle
+                            .join()
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .map(|o| (o, false));
+                    }
+                    if let Some(secs) = shell_timeout {
+                        if wait_start.elapsed() >= Duration::from_secs(secs) {
+                            return None;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+
+            let final_out = match output_result {
+                Some((output, _)) => ShellOut {
+                    pid,
+                    status: "ended".into(),
+                    cmd: cmd.clone(),
+                    args: args.clone(),
+                    started_ms: now_ms,
+                    exit_code: output.status.code(),
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    elapsed_ms: Some(elapsed_ms),
+                    timeout_secs: None,
+                },
+                None => {
+                    let t = shell_timeout.unwrap_or(0);
+                    println!("[HOST] shell_run: timed out after {t}s");
+                    ShellOut {
+                        pid,
+                        status: "timeout".into(),
+                        cmd: cmd.clone(),
+                        args: args.clone(),
+                        started_ms: now_ms,
+                        exit_code: Some(-1),
+                        stdout: String::new(),
+                        stderr: format!("Command timed out after {t}s"),
+                        elapsed_ms: Some(elapsed_ms),
+                        timeout_secs: shell_timeout,
+                    }
+                }
+            };
+
+            let final_yaml = serde_yaml::to_string(&final_out)
+                .unwrap_or_else(|_| "status: ended\n".into());
+
+            // Update the .out entry in pending_writes (push a new shadow entry)
+            caller
+                .data_mut()
+                .pending_writes
+                .push((vfs_path, final_yaml.into_bytes()));
+
+            println!(
+                "[HOST] shell_run: exit_code={:?} elapsed={elapsed_ms}ms",
+                final_out.exit_code
+            );
+
+            // Return JSON so the guest can read both pid and path in one call
+            let response = format!("{{\"pid\":{pid},\"path\":\"{guest_path}\"}}");
+            write_memory(&mut caller, out_ptr, out_cap, &response)
+        },
+    )?;
+
+    // ── shell_stdin ───────────────────────────────────────────────────────────
+    linker.func_wrap(
+        "host",
+        "shell_stdin",
+        |mut caller: Caller<'_, HostState>,
+         pid: i32,
+         keys_ptr: i32,
+         keys_len: i32|
+         -> i32 {
+            let pid_u32 = pid as u32;
+            if !caller.data().running_processes.contains_key(&pid_u32) {
+                return -1; // PID not found / already ended
+            }
+            let data = read_memory_bytes(&mut caller, keys_ptr, keys_len);
+            let child = match caller.data_mut().running_processes.get_mut(&pid_u32) {
+                Some(c) => c,
+                None => return -1,
+            };
+            match child.stdin.as_mut() {
+                Some(stdin) => {
+                    if stdin.write_all(&data).is_err() {
+                        return -2;
+                    }
+                    let _ = stdin.flush();
+                    0
+                }
+                None => -2,
+            }
+        },
+    )?;
+
+    // ── shell_kill ────────────────────────────────────────────────────────────
+    linker.func_wrap(
+        "host",
+        "shell_kill",
+        |mut caller: Caller<'_, HostState>, pid: i32, sig_ptr: i32, sig_len: i32| -> i32 {
+            let pid_u32 = pid as u32;
+            // Validate signal name first so -4 is returned even for unknown PIDs
+            let sig_name = match read_memory(&mut caller, sig_ptr, sig_len) {
+                Ok(s) if s.is_empty() => "SIGTERM".to_string(),
+                Ok(s) => s,
+                Err(_) => "SIGTERM".to_string(),
+            };
+            let signum: libc::c_int = match sig_name.as_str() {
+                "SIGTERM" => libc::SIGTERM,
+                "SIGKILL" => libc::SIGKILL,
+                "SIGINT" => libc::SIGINT,
+                "SIGHUP" => libc::SIGHUP,
+                _ => return -4,
+            };
+            if !caller.data().running_processes.contains_key(&pid_u32) {
+                return -1; // PID not found / already ended
+            }
+            let rc = unsafe { libc::kill(pid_u32 as libc::pid_t, signum) };
+            if rc != 0 {
+                return -2;
+            }
+            // Collect exit code non-blocking
+            let exit_code = caller
+                .data_mut()
+                .running_processes
+                .get_mut(&pid_u32)
+                .and_then(|c| c.try_wait().ok().flatten())
+                .and_then(|s| s.code());
+            caller.data_mut().running_processes.remove(&pid_u32);
+
+            // Update .out entry: state = killed
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            // Find the matching .out path and push a killed snapshot
+            // (We don't have the original vfs_path here; emit a generic update key)
+            // Best effort: push a kill record keyed by pid
+            let kill_yaml = format!(
+                "pid: {pid_u32}\nstatus: killed\nexit_code: {}\n",
+                exit_code.map(|c| c.to_string()).unwrap_or_else(|| "~".into())
+            );
+            let kill_key = format!("tmp/killed_{pid_u32}_{now_ms}.out");
+            caller
+                .data_mut()
+                .pending_writes
+                .push((kill_key, kill_yaml.into_bytes()));
+            0
+        },
+    )?;
+
     let tcow_path = env::var("TCOW_PATH").unwrap_or_else(|_| "agent.tcow".into());
     println!("[HOST] TCOW virtual FS: {tcow_path}");
 
-    let wasi = WasiCtxBuilder::new()
-        .inherit_stdio()
-        .build();
+    let wasi = WasiCtxBuilder::new().inherit_stdio().build();
     let state = HostState {
         prompt,
         final_answer: None,
@@ -329,6 +731,9 @@ fn main() -> Result<()> {
         wasi,
         tcow_path,
         pending_writes: Vec::new(),
+        shell_allow,
+        shell_timeout,
+        running_processes: HashMap::new(),
     };
 
     let mut store = Store::new(&engine, state);

@@ -15,13 +15,17 @@ The agent loop runs entirely inside a `.wasm` guest module. All privileged opera
 │  HostState                                                  │
 │  ├── XAI API key          (never crosses into guest)        │
 │  ├── reqwest HTTP client  (for Grok API calls)              │
-│  └── TcowFs               (virtual CoW filesystem)  [planned]│
+│  ├── tcow_path            path to agent.tcow on disk        │
+│  └── pending_writes       buffered VFS writes (flushed on exit)│
 │                                                             │
 │  Linker — host functions exposed to guest:                  │
 │  ├── host::get_prompt     read the initial prompt           │
 │  ├── host::grok_chat      call xAI Grok for inference       │
 │  ├── host::host_log       write a log line to host stdout   │
-│  └── host::emit_final     emit the agent's final answer     │
+│  ├── host::emit_final     emit the agent's final answer     │
+│  ├── host::fs_read        read a file from agent.tcow       │
+│  ├── host::fs_write       buffer a write to agent.tcow      │
+│  └── host::fs_list        list a directory in agent.tcow    │
 └──────────────────────┬──────────────────────────────────────┘
                        │  Wasmtime
 ┌──────────────────────▼──────────────────────────────────────┐
@@ -34,8 +38,10 @@ The agent loop runs entirely inside a `.wasm` guest module. All privileged opera
 │       3. dispatch tool:                                      │
 │            js_exec → run_js_in_boa() [Boa, in-guest]        │
 │              ├── console.log shim (captured stdout)          │
-│              ├── require()      [planned — TCOW-backed]      │
-│              └── fs.readFile()  [planned — TCOW-backed]      │
+│              ├── fs.readFile(path)  → host::fs_read          │
+│              ├── fs.writeFile(p,d)  → host::fs_write         │
+│              ├── fs.readdir(dir)    → host::fs_list          │
+│              └── require(path)      → fs.readFile + eval     │
 │       4. feed result back → repeat                          │
 │       5. emit_final() on done                               │
 └─────────────────────────────────────────────────────────────┘
@@ -56,19 +62,22 @@ All host functions use a simple `i32` ABI (pointer + length pairs, return value 
 | `grok_chat(req_json)` | Sends a chat request to xAI Grok, returns LLM decision JSON |
 | `host_log(msg)` | Emits a prefixed log line to host stdout |
 | `emit_final(answer)` | Signals the agent's final answer to the host |
+| `fs_read(path)` | Reads a file from the virtual `.tcow` filesystem (union view across all layers) |
+| `fs_write(path, data)` | Buffers a write; flushed as a new delta layer to `agent.tcow` on exit |
+| `fs_list(dir)` | Returns newline-delimited visible entry names under a directory |
 
 ### In-guest tool: `js_exec`
 
-`js_exec` is **not** a host function. JavaScript execution happens entirely inside the guest module using **[Boa](https://github.com/boa-dev/boa)**, a pure-Rust ES2020 interpreter compiled into the `.wasm` binary itself. The guest calls `run_js_in_boa(code)` directly — no round-trip to the host. `console.log` output is captured via an injected shim and returned alongside the final expression value as JSON.
+`js_exec` is **not** a host function. JavaScript execution happens entirely inside the guest module using **[Boa](https://github.com/boa-dev/boa)**, a pure-Rust ES2020 interpreter compiled into the `.wasm` binary itself. The guest calls `run_js_in_boa(code)` directly — no round-trip to the host for JS evaluation. `console.log` output is captured via an injected shim and returned alongside the final expression value as JSON.
 
-Virtual filesystem access is exposed **only to Boa**, not as Wasmtime host functions. Planned Boa-native APIs (backed by the TCOW library compiled into the guest):
+Virtual filesystem access is exposed to JS code via Boa native objects that call the `fs_*` host functions under the hood:
 
-| JS API | Description |
-|---|---|
-| `require(path)` | Load and execute a JS module from the virtual `.tcow` filesystem |
-| `fs.readFile(path)` | Read a file from the virtual `.tcow` filesystem, returns a string |
-
-See [docs/ADD_FS.md](docs/ADD_FS.md) for the full TCOW integration plan.
+| JS API | Backed by | Description |
+|---|---|---|
+| `fs.readFile(path)` | `host::fs_read` | Read a file from the virtual `.tcow` filesystem |
+| `fs.writeFile(path, data)` | `host::fs_write` | Write a file into the virtual `.tcow` filesystem |
+| `fs.readdir(dir)` | `host::fs_list` | List visible entries under a directory |
+| `require(path)` | `host::fs_read` + eval | Load and evaluate a JS module from the `.tcow` filesystem |
 
 ---
 
@@ -77,7 +86,7 @@ See [docs/ADD_FS.md](docs/ADD_FS.md) for the full TCOW integration plan.
 - The xAI API key lives **only in the host process** (env var / `.env` file). It is never written into guest linear memory.
 - The guest has **no ambient WASI authority** — no direct filesystem or network access. Everything goes through named host functions that the host explicitly registers.
 - JavaScript execution runs inside **[Boa](https://github.com/boa-dev/boa)**, a pure-Rust ES2020 interpreter compiled directly into the guest `.wasm` binary. It has no access to the host filesystem, network, or any WASI capability — only what the Boa `Context` explicitly provides.
-- Virtual filesystem access is exposed **only to Boa**, not to the Wasm module at large. Planned `require()` and `fs.readFile()` shims are implemented as Boa native objects backed by the TCOW library compiled into the guest. No `fs_*` host functions are needed — the guest never makes individual file-op calls back to the host.
+- Virtual filesystem access is scoped to the `.tcow` virtual FS. The `fs_*` host functions are registered in the Wasmtime linker, but JS code reaches them only through Boa native object wrappers (`fs.readFile`, `fs.writeFile`, `fs.readdir`, `require`). The real host filesystem is not reachable from JS. All writes are buffered in-process and flushed as a new delta layer to `agent.tcow` on clean exit, providing a persistent, auditable record across runs.
 
 ---
 
@@ -96,7 +105,7 @@ cargo build --manifest-path guest/Cargo.toml --target wasm32-wasip1
 XAI_API_KEY=your_key cargo run -- "What is the capital of Japan?"
 ```
 
-The host automatically rebuilds the guest if `guest/target/wasm32-wasip1/debug/guest.wasm` is stale.
+The host automatically rebuilds the guest if `guest/target/wasm32-wasip1/debug/guest.wasm` is stale. The virtual filesystem is stored in `agent.tcow` (path overridable via `TCOW_PATH` env var); it is created on the first write and extended with a new delta layer on each subsequent run.
 
 ---
 
@@ -122,5 +131,7 @@ The host automatically rebuilds the guest if `guest/target/wasm32-wasip1/debug/g
 
 ## Related
 
-- **[tcow CLI](https://github.com/mikesmullin/tcow)** — standalone tool to inspect and manipulate `.tcow` virtual filesystem files. (a copy of this src is checked out to `./tmp/tcow/` (read its `**/*.md` to understand the project in detail. also read `./docs/ADD_FS.md` to understand how it is planned to integrate with `wasm1` (integration is only planned; hasn't happened, yet))
-- **[docs/PLAN.md](docs/PLAN.md)** — full PRD including acceptance criteria and stretch goals. (although the implementation has changed since this PLAN was first written)
+- **[tcow CLI](https://github.com/mikesmullin/tcow)** — standalone tool to inspect and manipulate `.tcow` virtual filesystem files. A copy of the source is checked out to `./tmp/tcow/`; read its `**/*.md` for format details.
+- **[docs/ADD_FS.md](docs/ADD_FS.md)** — original PRD for the TCOW host-function integration (now implemented).
+- **[docs/SHELL.md](docs/SHELL.md)** — PRD for the planned `shell.run()` / `shell.stdin()` / `shell.kill()` sandboxed shell execution API.
+- **[docs/PLAN.md](docs/PLAN.md)** — original architecture PRD; some details have diverged from the current implementation.

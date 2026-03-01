@@ -50,6 +50,14 @@ unsafe extern "C" {
     fn fs_read(path_ptr: i32, path_len: i32, out_ptr: i32, out_cap: i32) -> i32;
     fn fs_write(path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32) -> i32;
     fn fs_list(dir_ptr: i32, dir_len: i32, out_ptr: i32, out_cap: i32) -> i32;
+    // Shell execution — validated against template allow-list on the host
+    fn shell_run(
+        cmd_ptr: i32, cmd_len: i32,
+        args_ptr: i32, args_len: i32,
+        out_ptr: i32, out_cap: i32,
+    ) -> i32;
+    fn shell_stdin(pid: i32, keys_ptr: i32, keys_len: i32) -> i32;
+    fn shell_kill(pid: i32, sig_ptr: i32, sig_len: i32) -> i32;
 }
 
 // ── Safe VFS wrappers called from Boa native functions ────────────────────────
@@ -118,9 +126,167 @@ fn vfs_list(dir: &str) -> Result<String, i32> {
     }
 }
 
-// ── Boa NativeFunction implementations ───────────────────────────────────────
+/// AI policy error message shown when the LLM attempts to use child_process.
+const CHILD_PROCESS_POLICY_MSG: &str =
+    "AI Policy Error: Use of child_process is prohibited for security reasons. \
+     Please use require('shell').run(cmd, args) which returns a string path to a YAML \
+     file in the virtual filesystem containing { exit_code, stdout, stderr }.";
 
-/// js: fs.readFile(path) → string  (throws on error)
+// ── child_process policy mock ─────────────────────────────────────────────────
+
+/// All child_process methods (exec, spawn, etc.) call this and throw.
+fn js_child_process_policy(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _ctx: &mut BoaContext,
+) -> JsResult<JsValue> {
+    Err(JsNativeError::error()
+        .with_message(CHILD_PROCESS_POLICY_MSG)
+        .into())
+}
+
+// ── shell.run / shell.stdin / shell.kill ──────────────────────────────────────
+
+/// js: shell.run(cmd, args?) → Promise-shim { pid, path, then(cb) }
+/// Also sets shell.lastPid and shell.lastFile on the shell object.
+fn js_shell_run(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
+    let cmd = args
+        .first()
+        .unwrap_or(&JsValue::undefined())
+        .to_string(ctx)?
+        .to_std_string_escaped();
+
+    // Collect the optional args array by iterating the JsObject directly
+    let mut cmd_args: Vec<String> = Vec::new();
+    if let Some(arg1) = args.get(1) {
+        if let Some(obj) = arg1.as_object() {
+            let len = obj
+                .get(js_string!("length"), ctx)
+                .ok()
+                .and_then(|v| v.to_u32(ctx).ok())
+                .unwrap_or(0);
+            for i in 0..len {
+                let item = obj.get(i, ctx).unwrap_or(JsValue::undefined());
+                cmd_args.push(
+                    item.to_string(ctx)
+                        .map(|s| s.to_std_string_escaped())
+                        .unwrap_or_default(),
+                );
+            }
+        }
+    }
+    let args_json = serde_json::to_string(&cmd_args).unwrap_or_else(|_| "[]".into());
+
+    let mut out_buf = vec![0u8; 1024];
+    let rc = unsafe {
+        shell_run(
+            cmd.as_ptr() as i32,
+            cmd.len() as i32,
+            args_json.as_ptr() as i32,
+            args_json.len() as i32,
+            out_buf.as_mut_ptr() as i32,
+            out_buf.len() as i32,
+        )
+    };
+    if rc < 0 {
+        let msg = match rc {
+            -1 => format!(
+                "AI Policy Error: shell.run command not in allow-list: {cmd:?}. \
+                 Check the template metadata.shell.allow list."
+            ),
+            -2 => format!("shell.run: failed to spawn process: {cmd:?}"),
+            _ => format!("shell.run: host error {rc} for command: {cmd:?}"),
+        };
+        return Err(JsNativeError::error().with_message(msg).into());
+    }
+
+    // Host returns JSON: {"pid": N, "path": "/tmp/..."}
+    let response = String::from_utf8_lossy(&out_buf[..rc as usize]).into_owned();
+    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap_or_default();
+    let pid = parsed["pid"].as_u64().unwrap_or(0);
+    let path = parsed["path"].as_str().unwrap_or("").to_string();
+
+    // Set lastPid and lastFile on the shell object (_this when called as shell.run(...))
+    if let Some(obj) = _this.as_object() {
+        let _ = obj.set(js_string!("lastPid"), JsValue::from(pid as f64), false, ctx);
+        let _ = obj.set(
+            js_string!("lastFile"),
+            JsValue::from(JsString::from(path.as_str())),
+            false,
+            ctx,
+        );
+    }
+
+    // Build Promise-shim: { pid, path, then(cb){...} } — constructed inline without temp globals
+    let path_json = serde_json::to_string(&path).unwrap_or_else(|_| "\"\"".into());
+    let code = format!(
+        "(function(){{var p={path_json},pid={pid};\
+          return{{pid:pid,path:p,then:function(cb){{if(typeof cb==='function')cb(p);return this;}}}};\
+         }})()"
+    );
+    ctx.eval(Source::from_bytes(code.as_bytes()))
+}
+
+/// js: shell.stdin(pid, sendkeys) → undefined
+fn js_shell_stdin(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
+    let pid = args
+        .first()
+        .unwrap_or(&JsValue::undefined())
+        .to_number(ctx)? as i32;
+    let keys = args
+        .get(1)
+        .unwrap_or(&JsValue::undefined())
+        .to_string(ctx)?
+        .to_std_string_escaped();
+    let rc = unsafe { shell_stdin(pid, keys.as_ptr() as i32, keys.len() as i32) };
+    match rc {
+        0 => Ok(JsValue::undefined()),
+        -1 => Err(JsNativeError::error()
+            .with_message("shell.stdin: PID not found or already ended")
+            .into()),
+        -2 => Err(JsNativeError::error()
+            .with_message("shell.stdin: write to child stdin failed")
+            .into()),
+        -3 => Err(JsNativeError::error()
+            .with_message("shell.stdin: PID is not a child of this session")
+            .into()),
+        _ => Err(JsNativeError::error()
+            .with_message(format!("shell.stdin: error {rc}"))
+            .into()),
+    }
+}
+
+/// js: shell.kill(pid, signal?) → undefined
+fn js_shell_kill(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
+    let pid = args
+        .first()
+        .unwrap_or(&JsValue::undefined())
+        .to_number(ctx)? as i32;
+    let signal = args
+        .get(1)
+        .and_then(|v| v.as_string())
+        .map(|s| s.to_std_string_escaped())
+        .unwrap_or_else(|| "SIGTERM".into());
+    let rc = unsafe { shell_kill(pid, signal.as_ptr() as i32, signal.len() as i32) };
+    match rc {
+        0 => Ok(JsValue::undefined()),
+        -1 => Err(JsNativeError::error()
+            .with_message("shell.kill: PID not found or already ended")
+            .into()),
+        -2 => Err(JsNativeError::error()
+            .with_message("shell.kill: kill syscall failed")
+            .into()),
+        -3 => Err(JsNativeError::error()
+            .with_message("shell.kill: PID not a child of this session")
+            .into()),
+        -4 => Err(JsNativeError::error()
+            .with_message(format!("shell.kill: invalid signal '{signal}'"))
+            .into()),
+        _ => Err(JsNativeError::error()
+            .with_message(format!("shell.kill: error {rc}"))
+            .into()),
+    }
+}
 fn js_fs_read_file(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
     let path = args
         .first()
@@ -179,13 +345,40 @@ fn js_fs_readdir(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsR
     }
 }
 
-/// js: require(path) → evaluates the .tcow file at path as JS, returns its result
+fn make_shell_obj(ctx: &mut BoaContext) -> JsValue {
+    JsValue::from(
+        ObjectInitializer::new(ctx)
+            .function(NativeFunction::from_fn_ptr(js_shell_run), js_string!("run"), 2)
+            .function(NativeFunction::from_fn_ptr(js_shell_stdin), js_string!("stdin"), 2)
+            .function(NativeFunction::from_fn_ptr(js_shell_kill), js_string!("kill"), 2)
+            .build(),
+    )
+}
+
+/// js: require(path) → evaluates the .tcow file at path as JS, returns its result.
+/// Special cases:
+///   require('child_process') → AI policy error
+///   require('shell')         → returns a fresh shell object (same API as global was)
 fn js_require(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
     let path = args
         .first()
         .unwrap_or(&JsValue::undefined())
         .to_string(ctx)?
         .to_std_string_escaped();
+
+    // Intercept well-known module names before any VFS lookup
+    match path.as_str() {
+        "child_process" => {
+            return Err(JsNativeError::error()
+                .with_message(CHILD_PROCESS_POLICY_MSG)
+                .into());
+        }
+        "shell" => {
+            return Ok(make_shell_obj(ctx));
+        }
+        _ => {}
+    }
+
     match vfs_read(&path) {
         Ok(bytes) => ctx.eval(Source::from_bytes(&bytes)),
         Err(-1) => Err(JsNativeError::error()
@@ -351,6 +544,53 @@ fn run_js_in_boa(code: &str) -> String {
         };
         return serde_json::to_string(&r).unwrap_or_default();
     }
+
+    // ── child_process mock (policy object — all methods throw) ────────────────
+    let cp_obj = ObjectInitializer::new(&mut ctx)
+        .function(
+            NativeFunction::from_fn_ptr(js_child_process_policy),
+            js_string!("exec"),
+            0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(js_child_process_policy),
+            js_string!("execSync"),
+            0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(js_child_process_policy),
+            js_string!("spawn"),
+            0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(js_child_process_policy),
+            js_string!("spawnSync"),
+            0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(js_child_process_policy),
+            js_string!("execFile"),
+            0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(js_child_process_policy),
+            js_string!("fork"),
+            0,
+        )
+        .build();
+    if let Err(e) =
+        ctx.register_global_property(js_string!("child_process"), cp_obj, Attribute::all())
+    {
+        let r = JsExecResult {
+            stdout: String::new(),
+            result: String::new(),
+            error: Some(format!("child_process setup failed: {e:?}")),
+        };
+        return serde_json::to_string(&r).unwrap_or_default();
+    }
+
+    // ── shell object available only via require('shell') ─────────────────────
+    // (not a global — agent must: const shell = require('shell'))
 
     // ── require(path)  (load + eval a JS file from the virtual FS) ───────────
     if let Err(e) = ctx.register_global_callable(
