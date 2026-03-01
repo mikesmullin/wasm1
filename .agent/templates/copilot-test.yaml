@@ -3,6 +3,7 @@ kind: Agent
 metadata:
   description: Copilot integration smoke test
   model: copilot:gpt-4o
+  #ignore_ssl: true
   context_window: 128000
 spec:
   max_steps: 6

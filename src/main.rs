@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use dotenvy::from_filename;
 use regex::Regex;
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
@@ -56,6 +56,8 @@ struct TemplateMetadata {
     shell: Option<ShellConfig>,
     /// Explicit tool allowlist for the session. Absent = all tools.
     tools: Option<Vec<String>>,
+    /// If true, disable SSL certificate validation for HTTP requests.
+    ignore_ssl: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -336,7 +338,7 @@ fn resolve_template(name: &str) -> Result<PathBuf> {
     ))
 }
 
-fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>, Option<u32>, Option<String>, Option<u32>, Vec<String>, Option<u64>, Vec<HookDef>, Option<String>, Vec<String>, Option<String>)> {
+fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>, Option<u32>, Option<String>, Option<u32>, Vec<String>, Option<u64>, Vec<HookDef>, Option<String>, Vec<String>, Option<String>, bool)> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read template: {}", path.display()))?;
     let template: Template = serde_yaml::from_str(&content)
@@ -413,8 +415,13 @@ fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>
         .as_ref()
         .and_then(|m| m.tools.clone())
         .unwrap_or_else(all_tool_names);
+    let ignore_ssl = template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.ignore_ssl)
+        .unwrap_or(false);
     println!(
-        "[HOST] Template loaded: {} shell allow-list entries, timeout: {}, model: {}, system_prompt: {}, max_steps: {}, validate: {}, max_validation_fails: {}, tools: [{}], hooks: {}, labels: {}, context_window: {}",
+        "[HOST] Template loaded: {} shell allow-list entries, timeout: {}, model: {}, system_prompt: {}, max_steps: {}, validate: {}, max_validation_fails: {}, tools: [{}], hooks: {}, labels: {}, context_window: {}, ignore_ssl: {}",
         regexes.len(),
         timeout.map(|t| format!("{t}s")).unwrap_or_else(|| "indefinite".into()),
         template_model.clone().unwrap_or_else(|| "unset".into()),
@@ -428,8 +435,9 @@ fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>
         hooks.len(),
         labels.len(),
         template_context_window.map(|n| format!("{n}")).unwrap_or_else(|| "unset".into()),
+        ignore_ssl,
     );
-    Ok((regexes, timeout, system_prompt, max_steps, validate_fn, max_validation_fails, tools, template_context_window, hooks, description, labels, template_model))
+    Ok((regexes, timeout, system_prompt, max_steps, validate_fn, max_validation_fails, tools, template_context_window, hooks, description, labels, template_model, ignore_ssl))
 }
 
 fn parse_provider_model(raw_model: &str) -> (ModelProvider, String) {
@@ -527,12 +535,12 @@ fn main() -> Result<()> {
         prompt.ok_or_else(|| anyhow!("usage: cargo run -- [clean|cron <once|watch>|-t <template>] \"<prompt>\""))?;
 
     // Load template allow-list if -t was supplied
-    let (shell_allow, shell_timeout, system_prompt, max_steps, validate_fn, max_validation_fails, enabled_tools, template_context_window, template_hooks, template_description, template_labels, template_model) = if let Some(ref name) = template_name {
+    let (shell_allow, shell_timeout, system_prompt, max_steps, validate_fn, max_validation_fails, enabled_tools, template_context_window, template_hooks, template_description, template_labels, template_model, ignore_ssl) = if let Some(ref name) = template_name {
         let path = resolve_template(name)?;
         println!("[HOST] Using template: {}", path.display());
         load_template(&path)?
     } else {
-        (Vec::new(), SHELL_TIMEOUT_DEFAULT, None, None, None, None, all_tool_names(), None, Vec::new(), None, Vec::new(), None)
+        (Vec::new(), SHELL_TIMEOUT_DEFAULT, None, None, None, None, all_tool_names(), None, Vec::new(), None, Vec::new(), None, false)
     };
     let effective_hooks = merge_hooks(load_global_hooks()?, template_hooks);
     println!("[HOST] Hooks loaded: {}", effective_hooks.len());
@@ -542,7 +550,10 @@ fn main() -> Result<()> {
     let model = template_model
         .or_else(|| env::var("XAI_MODEL").ok())
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let client = Client::new();
+    let client = ClientBuilder::new()
+        .danger_accept_invalid_certs(ignore_ssl)
+        .build()
+        .context("failed to build HTTP client")?;
     let (provider, model_name) = parse_provider_model(&model);
     let (api_key, provider_api_url, context_window) = match provider {
         ModelProvider::Xai => {

@@ -95,6 +95,8 @@ Virtual filesystem access is exposed to JS code via Boa native objects that call
 
 **Prerequisites:** Rust stable, `wasm32-wasip1` target, and provider auth:
 
+- Initialize vendored dependencies: `git submodule update --init --recursive` (includes `vendor/tcow`).
+
 - xAI: `XAI_API_KEY`
 - Copilot: `COPILOT_API_KEY`
 
