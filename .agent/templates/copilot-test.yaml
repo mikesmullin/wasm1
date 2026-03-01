@@ -1,0 +1,10 @@
+apiVersion: daemon/v1
+kind: Agent
+metadata:
+  description: Copilot integration smoke test
+  model: copilot:gpt-4o
+  context_window: 128000
+spec:
+  max_steps: 6
+  system_prompt: |
+    You are a concise assistant. Keep answers under 3 sentences.
