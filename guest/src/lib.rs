@@ -1,9 +1,10 @@
 use boa_engine::{
     js_string,
-    object::ObjectInitializer,
+    object::{builtins::JsArray, ObjectInitializer},
     property::Attribute,
     Context as BoaContext,
     JsNativeError,
+    JsObject,
     JsResult,
     JsString,
     JsValue,
@@ -129,7 +130,7 @@ fn vfs_list(dir: &str) -> Result<String, i32> {
 /// AI policy error message shown when the LLM attempts to use child_process.
 const CHILD_PROCESS_POLICY_MSG: &str =
     "AI Policy Error: Use of child_process is prohibited for security reasons. \
-     Please use require('shell').run(cmd, args) which returns a string path to a YAML \
+     Please use require('shell').run(cmd, args) which returns a string path to a JSON \
      file in the virtual filesystem containing { exit_code, stdout, stderr }.";
 
 // ── child_process policy mock ─────────────────────────────────────────────────
@@ -147,7 +148,7 @@ fn js_child_process_policy(
 
 // ── shell.run / shell.stdin / shell.kill ──────────────────────────────────────
 
-/// js: shell.run(cmd, args?) → Promise-shim { pid, path, then(cb) }
+/// js: shell.run(cmd, args?) → { pid, path }  (plain object, safe to `await`)
 /// Also sets shell.lastPid and shell.lastFile on the shell object.
 fn js_shell_run(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
     let cmd = args
@@ -217,13 +218,14 @@ fn js_shell_run(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsRe
         );
     }
 
-    // Build Promise-shim: { pid, path, then(cb){...} } — constructed inline without temp globals
+    // Return a plain (non-thenable) object so that:
+    //   const r = shell.run(...)        → works directly
+    //   const r = await shell.run(...)  → await wraps in already-resolved Promise,
+    //                                     one run_jobs() pass resumes with {pid,path}
+    // If .then existed (thenable), await would create a PromiseResolveThenableJob
+    // that resolves to just the callback arg (the path string), losing the object.
     let path_json = serde_json::to_string(&path).unwrap_or_else(|_| "\"\"".into());
-    let code = format!(
-        "(function(){{var p={path_json},pid={pid};\
-          return{{pid:pid,path:p,then:function(cb){{if(typeof cb==='function')cb(p);return this;}}}};\
-         }})()"
-    );
+    let code = format!("({{pid:{pid},path:{path_json}}})");
     ctx.eval(Source::from_bytes(code.as_bytes()))
 }
 
@@ -287,62 +289,175 @@ fn js_shell_kill(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsR
             .into()),
     }
 }
-fn js_fs_read_file(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
-    let path = args
-        .first()
-        .unwrap_or(&JsValue::undefined())
-        .to_string(ctx)?
-        .to_std_string_escaped();
+/// If the last argument is a callable function, return it.
+fn last_callable(args: &[JsValue]) -> Option<JsObject> {
+    args.last()
+        .and_then(|v| v.as_object())
+        .filter(|o| o.is_callable())
+}
+
+// ── fs shims ──────────────────────────────────────────────────────────────────
+// Each async variant (readFile, writeFile, readdir) matches Node.js v18 signature:
+//   readFile(path[, options][, callback])
+// If a callback is supplied it is called synchronously as cb(err, data).
+// If no callback is supplied the result is returned directly (sync convenience).
+// The Sync variants always return the value / throw — no callback.
+
+/// js: fs.readFileSync(path[, options]) → string  (throws on error)
+fn js_fs_read_file_sync(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
+    let path = args.first().unwrap_or(&JsValue::undefined()).to_string(ctx)?.to_std_string_escaped();
     match vfs_read(&path) {
-        Ok(bytes) => {
-            let s = String::from_utf8_lossy(&bytes).into_owned();
-            Ok(JsValue::from(JsString::from(s.as_str())))
-        }
+        Ok(bytes) => Ok(JsValue::from(JsString::from(
+            String::from_utf8_lossy(&bytes).as_ref(),
+        ))),
         Err(-1) => Err(JsNativeError::error()
-            .with_message(format!("fs.readFile: not found: {path}"))
+            .with_message(format!("ENOENT: no such file or directory, open '{path}'"))
             .into()),
         Err(code) => Err(JsNativeError::error()
-            .with_message(format!("fs.readFile: error {code} reading {path}"))
+            .with_message(format!("fs.readFileSync: error {code} reading '{path}'"))
             .into()),
     }
 }
 
-/// js: fs.writeFile(path, content)
-fn js_fs_write_file(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
-    let path = args
-        .first()
-        .unwrap_or(&JsValue::undefined())
-        .to_string(ctx)?
-        .to_std_string_escaped();
-    let content = args
-        .get(1)
-        .unwrap_or(&JsValue::undefined())
-        .to_string(ctx)?
-        .to_std_string_escaped();
+/// js: fs.readFile(path[, options][, callback])
+/// callback signature: (err, data: string) → void
+fn js_fs_read_file(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
+    let path = args.first().unwrap_or(&JsValue::undefined()).to_string(ctx)?.to_std_string_escaped();
+    let cb = last_callable(args);
+    match vfs_read(&path) {
+        Ok(bytes) => {
+            let data = JsValue::from(JsString::from(
+                String::from_utf8_lossy(&bytes).as_ref(),
+            ));
+            if let Some(cb_obj) = cb {
+                cb_obj.call(&JsValue::undefined(), &[JsValue::null(), data], ctx)?;
+                Ok(JsValue::undefined())
+            } else {
+                Ok(data)
+            }
+        }
+        Err(code) => {
+            let msg = if code == -1 {
+                format!("ENOENT: no such file or directory, open '{path}'")
+            } else {
+                format!("fs.readFile: error {code} reading '{path}'")
+            };
+            if let Some(cb_obj) = cb {
+                let err_val = JsValue::from(JsString::from(msg.as_str()));
+                cb_obj.call(&JsValue::undefined(), &[err_val], ctx)?;
+                Ok(JsValue::undefined())
+            } else {
+                Err(JsNativeError::error().with_message(msg).into())
+            }
+        }
+    }
+}
+
+/// js: fs.writeFileSync(path, data[, options]) → undefined  (throws on error)
+fn js_fs_write_file_sync(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
+    let path = args.first().unwrap_or(&JsValue::undefined()).to_string(ctx)?.to_std_string_escaped();
+    let content = args.get(1).unwrap_or(&JsValue::undefined()).to_string(ctx)?.to_std_string_escaped();
     match vfs_write(&path, content.as_bytes()) {
         Ok(()) => Ok(JsValue::undefined()),
         Err(code) => Err(JsNativeError::error()
-            .with_message(format!("fs.writeFile: error {code} writing {path}"))
+            .with_message(format!("fs.writeFileSync: error {code} writing '{path}'"))
             .into()),
     }
 }
 
-/// js: fs.readdir(dir) → newline-delimited string of entry names
-fn js_fs_readdir(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
-    let dir = args
-        .first()
-        .unwrap_or(&JsValue::undefined())
-        .to_string(ctx)?
-        .to_std_string_escaped();
+/// js: fs.writeFile(path, data[, options][, callback])
+/// callback signature: (err) → void
+fn js_fs_write_file(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
+    let path = args.first().unwrap_or(&JsValue::undefined()).to_string(ctx)?.to_std_string_escaped();
+    let content = args.get(1).unwrap_or(&JsValue::undefined()).to_string(ctx)?.to_std_string_escaped();
+    let cb = last_callable(args);
+    match vfs_write(&path, content.as_bytes()) {
+        Ok(()) => {
+            if let Some(cb_obj) = cb {
+                cb_obj.call(&JsValue::undefined(), &[JsValue::null()], ctx)?;
+            }
+            Ok(JsValue::undefined())
+        }
+        Err(code) => {
+            let msg = format!("fs.writeFile: error {code} writing '{path}'");
+            if let Some(cb_obj) = cb {
+                let err_val = JsValue::from(JsString::from(msg.as_str()));
+                cb_obj.call(&JsValue::undefined(), &[err_val], ctx)?;
+                Ok(JsValue::undefined())
+            } else {
+                Err(JsNativeError::error().with_message(msg).into())
+            }
+        }
+    }
+}
+
+/// js: fs.readdirSync(path[, options]) → Array<string>  (throws on error)
+fn js_fs_readdir_sync(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
+    let dir = args.first().unwrap_or(&JsValue::undefined()).to_string(ctx)?.to_std_string_escaped();
     match vfs_list(&dir) {
-        Ok(listing) => Ok(JsValue::from(JsString::from(listing.as_str()))),
+        Ok(listing) => {
+            let arr = JsArray::new(ctx);
+            for entry in listing.lines().filter(|s| !s.is_empty()) {
+                arr.push(JsValue::from(JsString::from(entry)), ctx)?;
+            }
+            Ok(arr.into())
+        }
         Err(-1) => Err(JsNativeError::error()
-            .with_message(format!("fs.readdir: not found: {dir}"))
+            .with_message(format!("ENOENT: no such file or directory, scandir '{dir}'"))
             .into()),
         Err(code) => Err(JsNativeError::error()
-            .with_message(format!("fs.readdir: error {code}"))
+            .with_message(format!("fs.readdirSync: error {code}"))
             .into()),
     }
+}
+
+/// js: fs.readdir(path[, options][, callback])
+/// callback signature: (err, entries: Array<string>) → void
+fn js_fs_readdir(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
+    let dir = args.first().unwrap_or(&JsValue::undefined()).to_string(ctx)?.to_std_string_escaped();
+    let cb = last_callable(args);
+    match vfs_list(&dir) {
+        Ok(listing) => {
+            let arr = JsArray::new(ctx);
+            for entry in listing.lines().filter(|s| !s.is_empty()) {
+                arr.push(JsValue::from(JsString::from(entry)), ctx)?;
+            }
+            let arr_val: JsValue = arr.into();
+            if let Some(cb_obj) = cb {
+                cb_obj.call(&JsValue::undefined(), &[JsValue::null(), arr_val], ctx)?;
+                Ok(JsValue::undefined())
+            } else {
+                Ok(arr_val)
+            }
+        }
+        Err(code) => {
+            let msg = if code == -1 {
+                format!("ENOENT: no such file or directory, scandir '{dir}'")
+            } else {
+                format!("fs.readdir: error {code}")
+            };
+            if let Some(cb_obj) = cb {
+                let err_val = JsValue::from(JsString::from(msg.as_str()));
+                cb_obj.call(&JsValue::undefined(), &[err_val], ctx)?;
+                Ok(JsValue::undefined())
+            } else {
+                Err(JsNativeError::error().with_message(msg).into())
+            }
+        }
+    }
+}
+
+fn make_fs_obj(ctx: &mut BoaContext) -> JsValue {
+    JsValue::from(
+        ObjectInitializer::new(ctx)
+            .function(NativeFunction::from_fn_ptr(js_fs_read_file),      js_string!("readFile"),      3)
+            .function(NativeFunction::from_fn_ptr(js_fs_read_file_sync), js_string!("readFileSync"), 2)
+            .function(NativeFunction::from_fn_ptr(js_fs_write_file),      js_string!("writeFile"),     4)
+            .function(NativeFunction::from_fn_ptr(js_fs_write_file_sync), js_string!("writeFileSync"), 3)
+            .function(NativeFunction::from_fn_ptr(js_fs_readdir),         js_string!("readdir"),       3)
+            .function(NativeFunction::from_fn_ptr(js_fs_readdir_sync),    js_string!("readdirSync"),   2)
+            .build(),
+    )
 }
 
 fn make_shell_obj(ctx: &mut BoaContext) -> JsValue {
@@ -375,6 +490,9 @@ fn js_require(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResu
         }
         "shell" => {
             return Ok(make_shell_obj(ctx));
+        }
+        "fs" => {
+            return Ok(make_fs_obj(ctx));
         }
         _ => {}
     }
@@ -519,23 +637,7 @@ fn run_js_in_boa(code: &str) -> String {
     }
 
     // ── fs object  (backed by TCOW virtual filesystem host functions) ─────────
-    let fs_obj = ObjectInitializer::new(&mut ctx)
-        .function(
-            NativeFunction::from_fn_ptr(js_fs_read_file),
-            js_string!("readFile"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(js_fs_write_file),
-            js_string!("writeFile"),
-            2,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(js_fs_readdir),
-            js_string!("readdir"),
-            1,
-        )
-        .build();
+    let fs_obj = make_fs_obj(&mut ctx);
     if let Err(e) = ctx.register_global_property(js_string!("fs"), fs_obj, Attribute::all()) {
         let r = JsExecResult {
             stdout: String::new(),
@@ -608,6 +710,14 @@ fn run_js_in_boa(code: &str) -> String {
 
     // ── run user code ─────────────────────────────────────────────────────────
     let user_result = ctx.eval(Source::from_bytes(code));
+
+    // Drain the Promise job queue. Boa's SimpleJobQueue::run_jobs loops internally
+    // until the queue is empty, so one call handles all chained awaits:
+    //   await shell.run() → PromiseReactionJob → resume → next await → ... → done.
+    // We call it twice as a belt-and-suspenders: in case a job enqueued during the
+    // first drain itself enqueues more jobs that slipped through.
+    let _ = ctx.run_jobs();
+    let _ = ctx.run_jobs();
 
     let stdout = match ctx.eval(Source::from_bytes("__logs.join('\\n')")) {
         Ok(v) => v.to_string(&mut ctx)

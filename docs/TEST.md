@@ -78,7 +78,7 @@ cargo run -- -t solo "what is 2+2" 2>&1 | grep "\[HOST\]" | head -4
 
 ---
 
-### T4 — `shell.run('echo', ['hello'])` — allowed command, `.out` has correct YAML
+### T4 — `shell.run('echo', ['hello'])` — allowed command, `.out.json` has correct JSON
 
 ```bash
 cargo run -- -t solo \
@@ -92,13 +92,9 @@ cargo run -- -t solo \
 [HOST] shell_run: exit_code=Some(0) elapsed=...ms
 ```
 
-**Expected YAML in Tool result stdout:**
-```yaml
-status: ended
-exit_code: 0
-stdout: |
-  hello world
-stderr: ''
+**Expected JSON in Tool result stdout:**
+```json
+{"status":"ended","exit_code":0,"stdout":"hello world\n","stderr":""}
 ```
 
 **Result: ✅ PASS**
@@ -194,12 +190,9 @@ cargo run -- -t solo \
 [HOST] shell_run: exit_code=Some(-1) elapsed=...ms
 ```
 
-**Expected YAML in Tool result stdout:**
-```yaml
-status: timeout
-exit_code: -1
-stderr: Command timed out after 5s
-timeout_secs: 5
+**Expected JSON in Tool result stdout:**
+```json
+{"status":"timeout","exit_code":-1,"stderr":"Command timed out after 5s","timeout_secs":5}
 ```
 
 **Result: ✅ PASS**
@@ -213,8 +206,8 @@ After the test restore the template (comment `timeout_secs` back out):
       ...
 ```
 
-> **Note:** `timeout_secs` is omitted from `.out` YAML entirely on normal
-> (`status: ended`) runs — it is only emitted when a timeout actually fires.
+> **Note:** `timeout_secs` is omitted from `.out.json` entirely on normal
+> (`status: "ended"`) runs — it is only emitted when a timeout actually fires.
 
 ---
 
@@ -280,17 +273,17 @@ Covered inline by T4, T8. The `.out` path returned by `shell.run` is passed to
 
 ---
 
-### T12 — `tcow ls agent.tcow` shows `/tmp/*.out` files after a run
+### T12 — `tcow ls agent.tcow` shows `/tmp/*.out.json` files after a run
 
-After any successful `shell.run` call, the `.out` files are flushed to the
+After any successful `shell.run` call, the `.out.json` files are flushed to the
 persistent `agent.tcow` layer.  Inspect them:
 
 ```bash
-tcow ls agent.tcow | grep '\.out'
-# e.g. tmp/1772328876452_eb8652.out
+tcow ls agent.tcow | grep '\.out\.json'
+# e.g. /tmp/1772328876452_eb8652.out.json
 
-tcow cat agent.tcow tmp/1772328876452_eb8652.out
-# prints the full YAML
+tcow cat agent.tcow tmp/1772328876452_eb8652.out.json
+# prints the full JSON
 ```
 
 ---
@@ -317,13 +310,14 @@ r.path: /tmp/<timestamp>_<sha1>.out
 
 > `shell.lastPid` and `shell.lastFile` are overwritten on every subsequent
 > `shell.run()` call on the same shell object.  `r.pid` and `r.path` on the
-> returned shim are frozen at the time of that specific run.
+> returned shim are frozen at the time of that specific run.  `r.path` ends
+> in `.out.json`.
 
 **Result: ✅ PASS**
 
 ---
 
-### T13 — Persistence across restarts — old `.out` still readable
+### T13 — Persistence across restarts — old `.out.json` still readable
 
 Pick any `.out` path logged in a previous run and ask the agent to read it in a
 new invocation:
@@ -337,7 +331,7 @@ cargo run -- -t solo \
 **Expected:** The YAML content from the previous run is returned — `agent.tcow`
 delta layers are read across process restarts without re-running the command.
 
-**Result: ✅ PASS** (returned T4's `echo hello world` YAML, `exit_code: 0`, `stdout: hello world`)
+**Result: ✅ PASS** (returned T4's `echo hello world` JSON, `exit_code: 0`, `stdout: "hello world\n"`)
 
 ## Summary Table
 
@@ -346,15 +340,15 @@ delta layers are read across process restarts without re-running the command.
 | T1 | `-t` basename not found → clear error | ✅ |
 | T2 | `-t` absolute path → loaded directly | ✅ |
 | T3 | `-t` basename → resolved via `INCLUDE_PATH` | ✅ |
-| T4 | `shell.run('echo', [...])` allowed → correct `.out` YAML | ✅ |
+| T4 | `shell.run('echo', [...])` allowed → correct `.out.json` | ✅ |
 | T5 | `shell.run('rm', ...)` denied → host never spawns, JS throws | ✅ |
 | T6 | `child_process.exec()` → policy error thrown | ✅ |
 | T7 | `require('child_process')` → same policy error | ✅ |
-| T8 | Timeout (`sleep 10`, `timeout_secs: 5`) → `status: timeout`, `timeout_secs: 5` in `.out` | ✅ |
+| T8 | Timeout (`sleep 10`, `timeout_secs: 5`) → `status: timeout`, `timeout_secs: 5` in `.out.json` | ✅ |
 | T9 | `shell.stdin` / `shell.kill` with dead PID → `-1` / JS throws | ✅ |
 | T10 | `shell.kill` invalid signal → `-4` / JS throws | ✅ |
-| T11 | `fs.readFile(outPath)` returns YAML | ✅ (via T4/T8) |
-| T12 | `tcow ls` shows `/tmp/*.out` | ✅ |
-| T13 | Old `.out` readable after restart | ✅ |
+| T11 | `fs.readFile(outPath)` returns JSON | ✅ (via T4/T8) |
+| T12 | `tcow ls` shows `/tmp/*.out.json` | ✅ |
+| T13 | Old `.out.json` readable after restart | ✅ |
 | T14 | `shell.lastPid`, `shell.lastFile`, `r.pid` set after `shell.run()` | ✅ |
 

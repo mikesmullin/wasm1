@@ -13,7 +13,7 @@ This document describes the design for allowing the AI agent to execute shell co
 The design has two interlocking parts:
 
 1. **`child_process` mock** — Any attempt by the LLM to use Node-style `child_process.*` APIs is intercepted and returns an AI-readable policy error, nudging the model toward the approved API.
-2. **`shell.run(cmd, args)` host function** — The approved shell execution API. Commands are validated against a per-agent regexp allow-list defined in a YAML template. Output is written to the virtual `.tcow` filesystem as a YAML file; the agent retrieves results by reading that file path with `fs.readFile()`.
+2. **`shell.run(cmd, args)` host function** — The approved shell execution API. Commands are validated against a per-agent regexp allow-list defined in a YAML template. Output is written to the virtual `.tcow` filesystem as a **JSON file** (`.out.json`); the agent retrieves results by reading that file path with `fs.readFile()` and parsing with `JSON.parse()`.
 
 ---
 
@@ -89,7 +89,7 @@ Before user code runs inside `run_js_in_boa()`, a `child_process` module shim is
 
    ```
    AI Policy Error: Use of child_process.exec() is prohibited for security reasons.
-   Please use require('shell').run(cmd, args) which returns a string path to a YAML
+   Please use require('shell').run(cmd, args) which returns a string path to a JSON
    file in the virtual filesystem containing { exit_code, stdout, stderr }.
    ```
 
@@ -116,7 +116,7 @@ const p = require('shell').run(cmd, args);
 
 - `cmd` — executable name or path (e.g. `"git"`)
 - `args` — array of string arguments; optional, defaults to `[]`
-- **Returns a `Promise<string>`** that resolves to the `.out` file path when the child process exits.
+- **Returns a `Promise<string>`** that resolves to the `.out.json` file path when the child process exits.
 
 Because Boa does not have a native async runtime, the Promise is a lightweight shim object with one method: `.then(fn)`. The `.then` callback is called synchronously (the host blocks on process completion before returning). The Promise shape is provided for forwards compatibility and ergonomic familiarity:
 
@@ -127,7 +127,7 @@ const result = fs.readFile(outPath);
 console.log(result);
 ```
 
-**The `.out` file is written to the virtual FS immediately** when `shell.run()` is called — before the process exits — with `state: running`. This allows the agent to skip `await` and poll the file repeatedly for interactive workflows:
+**The `.out.json` file is written to the virtual FS immediately** when `shell.run()` is called — before the process exits — with `status: "running"`. This allows the agent to skip `await` and poll the file repeatedly for interactive workflows:
 
 ```js
 // Non-awaiting / polling pattern:
@@ -135,8 +135,8 @@ const outPath = shell.run('some-interactive-cmd', []).path;  // .path available 
 // ... do other work ...
 let out;
 do {
-  out = fs.readFile(outPath);
-} while (out.includes('state: running'));
+  out = JSON.parse(fs.readFile(outPath));
+} while (out.status === 'running');
 console.log('done:', out);
 ```
 
@@ -150,7 +150,7 @@ shell.stdin(pid, 'Y\n');   // answer a y/n prompt
 // poll outPath until state: ended
 ```
 
-- `pid` — the integer PID from the `.out` file's `pid:` field
+- `pid` — the integer PID from the `.out.json` file's `pid` field
 - `sendkeys` — string to write to the process's stdin (raw bytes; use `\n` for Enter)
 - Returns `undefined`; throws if PID is not a child of the current agent session or is already ended.
 
@@ -168,10 +168,10 @@ shell.kill(pid, 'SIGKILL');  // forceful kill
 shell.kill(pid, 'SIGINT');   // Ctrl-C equivalent
 ```
 
-- `pid` — the integer PID from the `.out` file's `pid:` field
+- `pid` — the integer PID from the `.out.json` file's `pid` field
 - `signal` — optional signal name string; one of `SIGTERM` (default), `SIGKILL`, `SIGINT`, `SIGHUP`
 - Returns `undefined` on success; throws if PID is not a session child, is already ended, or signal name is unrecognised.
-- After a successful kill the `.out` file is updated with `state: killed` and the actual exit code.
+- After a successful kill the `.out.json` file is updated with `status: "killed"` and the actual exit code.
 
 ### 5.2 Allow-list check (host-side)
 
@@ -188,45 +188,46 @@ Matching uses Rust's `regex` crate, case-sensitive, against the full `"cmd arg1 
 
 On allow-list pass:
 
-1. Generates the output filename **before spawning**: `/tmp/{unix_time_ms}_{6_char_sha1}.out`
+1. Generates the output filename **before spawning**: `/tmp/{unix_time_ms}_{6_char_sha1}.out.json`
    - `unix_time_ms` — `SystemTime::now()` milliseconds since epoch
    - `6_char_sha1` — first 6 hex chars of `sha1("{cmd} {args} {unix_time_ms}")`
-2. Writes an **initial** YAML snapshot to `pending_writes` immediately (state `running`):
+2. Writes an **initial JSON snapshot** to `pending_writes` immediately (status `running`):
 
-```yaml
-pid: 12345
-state: running
-cmd: some-interactive-cmd
-args: []
-started_ms: 1709123456789
-stdout: ""
-stderr: ""
-exit_code: ~
-elapsed_ms: ~
+```json
+{
+  "pid": 12345,
+  "status": "running",
+  "cmd": "some-interactive-cmd",
+  "args": [],
+  "started_ms": 1709123456789,
+  "stdout": "",
+  "stderr": "",
+  "exit_code": null,
+  "elapsed_ms": null
+}
 ```
 
 3. Spawns the process via `std::process::Command` with `stdout(Stdio::piped())` and `stderr(Stdio::piped())`.
 4. Stores the `Child` handle in `HostState::running_processes: HashMap<u32, Child>` keyed by PID.
-5. Waits for the process to exit (blocking, up to `SHELL_TIMEOUT_SECS`), reading stdout/stderr as it completes.
-6. Updates the `.out` entry in `pending_writes` with the final YAML:
+5. Waits for the process to exit (blocking, up to `shell_timeout`), reading stdout/stderr as it completes.
+6. Updates the `.out.json` entry in `pending_writes` with the final JSON:
 
-```yaml
-pid: 12345
-state: ended
-cmd: git
-args:
-  - status
-  - --short
-started_ms: 1709123456789
-exit_code: 0
-stdout: |
-  M src/main.rs
-stderr: ""
-elapsed_ms: 124
+```json
+{
+  "pid": 12345,
+  "status": "ended",
+  "cmd": "git",
+  "args": ["status", "--short"],
+  "started_ms": 1709123456789,
+  "exit_code": 0,
+  "stdout": "M src/main.rs\n",
+  "stderr": "",
+  "elapsed_ms": 124
+}
 ```
 
 7. Removes the PID from `running_processes`.
-8. Returns the `.out` path string to the guest.
+8. Returns the `.out.json` path string to the guest.
 
 ---
 
@@ -247,12 +248,12 @@ elapsed_ms: 124
   │                                                   ┌────────────────────────────────┐
   │                                                   │ 1. allow-list regexp check     │
   │                                                   │    (metadata.shell.allow)      │
-  │                                                   │ 2. write initial .out (running)│
+  │                                                   │ 2. write initial .out.json (running)│
   │                                                   │ 3. spawn child process         │
   │                                                   │ 4. store Child in HashMap<pid> │
   │                                                   │ 5. wait + capture output       │
-  │                                                   │ 6. update .out (ended)         │
-  │                                                   │ 7. return .out path            │
+  │                                                   │ 6. update .out.json (ended)    │
+  │                                                   │ 7. return .out.json path       │
   │                                                   └────────────────────────────────┘
   │                                                               │
   ├── shell.stdin(pid, keys)  ────────────────────────────────────┼──────┐
@@ -269,10 +270,10 @@ elapsed_ms: 124
                                                    ┌────────────────────────────────┐
                                                    │ validate pid ∈ running_processes│
                                                    │ send signal to child process    │
-                                                   │ update .out  state: killed      │
+                                                   │ update .out.json  status: killed│
                                                    └────────────────────────────────┘
                                                                │
-                                                      agent.tcow  (/tmp/*.out)
+                                                      agent.tcow  (/tmp/*.out.json)
 ```
 
 ---
@@ -347,7 +348,7 @@ Accepted signal names: `SIGTERM`, `SIGKILL`, `SIGINT`, `SIGHUP`. Any other value
 
 Error codes: `-1` PID not found / already ended, `-2` kill syscall failed, `-3` not a child of this session, `-4` invalid signal name.
 
-After a successful kill, the `.out` entry in `pending_writes` is updated: `state: killed`, `exit_code` set to the actual exit code collected by a non-blocking `waitpid`.
+After a successful kill, the `.out.json` entry in `pending_writes` is updated: `status: "killed"`, `exit_code` set to the actual exit code collected by a non-blocking `waitpid`.
 
 ### 7.3 New Cargo dependencies
 
@@ -425,8 +426,8 @@ require('shell')          → returns the shell object (same reference as global
 | LLM cannot send stdin to arbitrary PIDs | `shell_stdin` validates PID against `running_processes` — only PIDs created by `shell.run` in this session |
 | LLM cannot kill arbitrary host processes | `shell_kill` validates PID against the same session-scoped `running_processes` map before issuing any signal |
 | LLM cannot read arbitrary host files | `fs.*` only reads from `.tcow` virtual FS |
-| Command output is auditable | Every `/tmp/*.out` file is flushed to `agent.tcow`; full history is permanently queryable via `tcow cat` |
-| Timeout limits runaway commands | `shell_timeout_secs` hard-kills the child and sets `state: timed_out` in the `.out` file |
+| Command output is auditable | Every `/tmp/*.out.json` file is flushed to `agent.tcow`; full history is permanently queryable via `tcow cat` |
+| Timeout limits runaway commands | `shell_timeout_secs` hard-kills the child and sets `status: "timeout"` in the `.out.json` file |
 | No ambient WASI authority | Unchanged — guest still has no direct WASI fs/net access |
 
 ---
@@ -437,20 +438,20 @@ require('shell')          → returns the shell object (same reference as global
 |---|---|
 | Agent uses `child_process.exec()` | Policy error thrown; LLM receives error and re-plans |
 | Agent uses `require('child_process')` | Same policy error via `require` intercept |
-| `shell.run('echo', ['hello'])` with `^echo\b` in allow-list | Returns Promise; `.out` has `state: ended`, `exit_code: 0`, `stdout: "hello\n"` |
+| `shell.run('echo', ['hello'])` with `^echo\b` in allow-list | Returns Promise; `.out.json` has `status: "ended"`, `exit_code: 0`, `stdout: "hello\n"` |
 | `shell.run('rm', ['-rf', '/'])` with no matching allow entry | Host rejects before spawn; JS error surfaced to LLM |
 | `-t` given a basename; file exists in `.agent/templates/` | Resolved and loaded; INCLUDE_PATH search used |
 | `-t` given an absolute path | File loaded directly, no search |
 | `-t` basename not found in any INCLUDE_PATH dir | Process exits with clear error |
-| Command times out (> `shell_timeout_secs`) | Child killed; `.out` has `state: timed_out`, `exit_code: -1` |
-| Agent polls `.out` while process is running | `state: running` returned; updates to `state: ended` after process exits |
+| Command times out (> `shell_timeout_secs`) | Child killed; `.out.json` has `status: "timeout"`, `exit_code: -1` |
+| Agent polls `.out.json` while process is running | `status: "running"` returned; updates to `status: "ended"` after process exits |
 | `shell.stdin(pid, 'Y\n')` to a running process | Bytes written to child stdin; next `fs.readFile(outPath)` reflects new stdout |
 | `shell.stdin(pid, ...)` with dead or foreign PID | Returns `-1`; JS throws |
-| `shell.kill(pid)` (SIGTERM) on a running process | Child receives SIGTERM; `.out` updated to `state: killed` |
-| `shell.kill(pid, 'SIGKILL')` on a running process | Child forcefully terminated; `.out` updated to `state: killed` |
-| `shell.kill(pid, 'SIGINT')` on a running process | Child receives SIGINT (Ctrl-C); `.out` updated to `state: killed` |
+| `shell.kill(pid)` (SIGTERM) on a running process | Child receives SIGTERM; `.out.json` updated to `status: "killed"` |
+| `shell.kill(pid, 'SIGKILL')` on a running process | Child forcefully terminated; `.out.json` updated to `status: "killed"` |
+| `shell.kill(pid, 'SIGINT')` on a running process | Child receives SIGINT (Ctrl-C); `.out.json` updated to `status: "killed"` |
 | `shell.kill(pid, ...)` with dead or foreign PID | Returns `-1`; JS throws |
 | `shell.kill(pid, 'SIGXXX')` with invalid signal | Returns `-4`; JS throws |
-| Agent reads output path with `fs.readFile()` | Returns YAML string from `.tcow /tmp/*.out` entry |
-| `tcow ls agent.tcow` after shell command | `/tmp/*.out` file(s) visible in union view |
-| Across agent restarts, old `/tmp/*.out` still readable | `.tcow` persistence via delta layers |
+| Agent reads output path with `fs.readFile()` | Returns JSON string from `.tcow /tmp/*.out.json` entry |
+| `tcow ls agent.tcow` after shell command | `/tmp/*.out.json` file(s) visible in union view |
+| Across agent restarts, old `/tmp/*.out.json` still readable | `.tcow` persistence via delta layers |

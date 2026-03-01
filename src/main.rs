@@ -24,7 +24,6 @@ const SHELL_TIMEOUT_DEFAULT: Option<u64> = None;
 #[derive(Debug, Deserialize, Default)]
 struct Template {
     metadata: Option<TemplateMetadata>,
-    #[allow(dead_code)]
     spec: Option<TemplateSpec>,
 }
 
@@ -44,7 +43,6 @@ struct ShellConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[allow(dead_code)]
 struct TemplateSpec {
     system_prompt: Option<String>,
 }
@@ -83,6 +81,8 @@ struct HostState {
     shell_timeout: Option<u64>,
     /// Live child processes spawned this session, keyed by PID.
     running_processes: HashMap<u32, Child>,
+    /// System prompt from template spec.system_prompt, if any.
+    system_prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,7 +169,7 @@ fn resolve_template(name: &str) -> Result<PathBuf> {
     ))
 }
 
-fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>)> {
+fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>)> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read template: {}", path.display()))?;
     let template: Template = serde_yaml::from_str(&content)
@@ -187,12 +187,14 @@ fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>)> {
         .iter()
         .map(|pat| Regex::new(pat).with_context(|| format!("invalid regex in template: {pat}")))
         .collect::<Result<Vec<_>>>()?;
+    let system_prompt = template.spec.and_then(|s| s.system_prompt);
     println!(
-        "[HOST] Template loaded: {} shell allow-list entries, timeout: {}",
+        "[HOST] Template loaded: {} shell allow-list entries, timeout: {}, system_prompt: {}",
         regexes.len(),
-        timeout.map(|t| format!("{t}s")).unwrap_or_else(|| "indefinite".into())
+        timeout.map(|t| format!("{t}s")).unwrap_or_else(|| "indefinite".into()),
+        system_prompt.as_deref().map(|s| format!("{} chars", s.len())).unwrap_or_else(|| "none".into())
     );
-    Ok((regexes, timeout))
+    Ok((regexes, timeout, system_prompt))
 }
 
 fn main() -> Result<()> {
@@ -213,12 +215,12 @@ fn main() -> Result<()> {
         prompt.ok_or_else(|| anyhow!("usage: cargo run -- [-t <template>] \"<prompt>\""))?;
 
     // Load template allow-list if -t was supplied
-    let (shell_allow, shell_timeout) = if let Some(ref name) = template_name {
+    let (shell_allow, shell_timeout, system_prompt) = if let Some(ref name) = template_name {
         let path = resolve_template(name)?;
         println!("[HOST] Using template: {}", path.display());
         load_template(&path)?
     } else {
-        (Vec::new(), SHELL_TIMEOUT_DEFAULT)
+        (Vec::new(), SHELL_TIMEOUT_DEFAULT, None)
     };
 
     println!("[HOST] Starting agent with prompt: {:?}", prompt);
@@ -502,8 +504,8 @@ fn main() -> Result<()> {
             let sha_hex: String =
                 sha_bytes.iter().take(3).map(|b| format!("{b:02x}")).collect();
             // Store in virtual FS under "tmp/..." (leading slash stripped)
-            let vfs_path = format!("tmp/{}_{}.out", now_ms, sha_hex);
-            let guest_path = format!("/tmp/{}_{}.out", now_ms, sha_hex);
+            let vfs_path = format!("tmp/{}_{}.out.json", now_ms, sha_hex);
+            let guest_path = format!("/tmp/{}_{}.out.json", now_ms, sha_hex);
 
             // Write initial YAML to pending_writes
             let initial = ShellOut {
@@ -518,12 +520,12 @@ fn main() -> Result<()> {
                 elapsed_ms: None,
                 timeout_secs: None,
             };
-            let initial_yaml = serde_yaml::to_string(&initial)
-                .unwrap_or_else(|_| "status: running\n".into());
+            let initial_json = serde_json::to_string(&initial)
+                .unwrap_or_else(|_| "{\"status\":\"running\"}".into());
             caller
                 .data_mut()
                 .pending_writes
-                .push((vfs_path.clone(), initial_yaml.into_bytes()));
+                .push((vfs_path.clone(), initial_json.into_bytes()));
 
             println!("[HOST] shell_run: spawning {:?} {:?}", cmd, args);
             let start = Instant::now();
@@ -611,14 +613,14 @@ fn main() -> Result<()> {
                 }
             };
 
-            let final_yaml = serde_yaml::to_string(&final_out)
-                .unwrap_or_else(|_| "status: ended\n".into());
+            let final_json = serde_json::to_string(&final_out)
+                .unwrap_or_else(|_| "{\"status\":\"ended\"}".into());
 
-            // Update the .out entry in pending_writes (push a new shadow entry)
+            // Update the .out.json entry in pending_writes (push a new shadow entry)
             caller
                 .data_mut()
                 .pending_writes
-                .push((vfs_path, final_yaml.into_bytes()));
+                .push((vfs_path, final_json.into_bytes()));
 
             println!(
                 "[HOST] shell_run: exit_code={:?} elapsed={elapsed_ms}ms",
@@ -705,15 +707,15 @@ fn main() -> Result<()> {
             // Find the matching .out path and push a killed snapshot
             // (We don't have the original vfs_path here; emit a generic update key)
             // Best effort: push a kill record keyed by pid
-            let kill_yaml = format!(
-                "pid: {pid_u32}\nstatus: killed\nexit_code: {}\n",
-                exit_code.map(|c| c.to_string()).unwrap_or_else(|| "~".into())
+            let kill_json = format!(
+                "{{\"pid\":{pid_u32},\"status\":\"killed\",\"exit_code\":{}}}",
+                exit_code.map(|c| c.to_string()).unwrap_or_else(|| "null".into())
             );
-            let kill_key = format!("tmp/killed_{pid_u32}_{now_ms}.out");
+            let kill_key = format!("tmp/killed_{pid_u32}_{now_ms}.out.json");
             caller
                 .data_mut()
                 .pending_writes
-                .push((kill_key, kill_yaml.into_bytes()));
+                .push((kill_key, kill_json.into_bytes()));
             0
         },
     )?;
@@ -734,6 +736,7 @@ fn main() -> Result<()> {
         shell_allow,
         shell_timeout,
         running_processes: HashMap::new(),
+        system_prompt,
     };
 
     let mut store = Store::new(&engine, state);
@@ -794,7 +797,7 @@ fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
   }
 ]"#;
 
-    let system = "You are an agent planner. Return ONLY valid JSON with schema:\n\
+    let base_system = "You are an agent planner. Return ONLY valid JSON with schema:\n\
 {\"type\":\"tool_call\",\"tool\":\"js_exec\",\"code\":\"...\",\"thought\":\"...\"}\n\
 or\n\
 {\"type\":\"final\",\"answer\":\"...\",\"thought\":\"...\"}.\n\
@@ -802,6 +805,14 @@ IMPORTANT: When you receive a js_exec result, the 'stdout' field IS the output o
 Whatever value is printed by console.log or returned is the CORRECT answer from the sandbox. \
 Accept it and return a final answer. Do NOT re-run the same code hoping for a different result.\n\
 JS runs in Boa inside Wasm. Available globals: console.log, fs.readFile(path), fs.writeFile(path, content), fs.readdir(dir), require(path). The real host filesystem is NOT accessible from JS. No markdown, no code fences.";
+
+    let system_owned: String;
+    let system: &str = if let Some(ref sp) = state.system_prompt {
+        system_owned = format!("{}\n\n---\n{}", sp, base_system);
+        &system_owned
+    } else {
+        base_system
+    };
 
     let user = match &req.tool_result {
         Some(result) => {
