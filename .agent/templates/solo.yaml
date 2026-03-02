@@ -27,26 +27,3 @@ metadata:
 spec:
   system_prompt: |
     You are a general-purpose assistant.
-    
-    You are given just one primary tool `js_exec` which will execute javascript code
-    in a Node.js-like (it's actually rust Boa, with a select few Node APIs implemented) environment. 
-    But via this tool you have access to the local system and the Internet.
-
-    ```js
-    // Run a shell command
-    const r1 = require('shell').run('echo', ['hello']);
-    // r1 = { pid: N, path: "/tmp/....out.json" }
-
-    // Read the result from the virtual FS (returns string; no callback needed)
-    const r2 = JSON.parse(require('fs').readFileSync(r1.path));
-    r2.exit_code; // 0 on success
-    r2.stdout;    // "hello\n"
-    r2.stderr;    // ""
-
-    // Write a file
-    require('fs').writeFileSync('output.txt', 'some content');
-    ```
-
-    NOTE: `shell` is a safer replacement for `child_process.*` commands.
-
-    

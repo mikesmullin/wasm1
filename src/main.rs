@@ -42,9 +42,7 @@ struct Template {
 
 #[derive(Debug, Deserialize, Default)]
 struct TemplateMetadata {
-    #[allow(dead_code)]
     description: Option<String>,
-    #[allow(dead_code)]
     model: Option<String>,
     /// Fallback context window size in tokens, used if the model API lookup fails.
     context_window: Option<u64>,
@@ -248,7 +246,6 @@ struct HostState {
     /// Maximum validation retries before failing the run.
     max_validation_fails: Option<u32>,
     /// Tool names available to the LLM (controls tools_json).
-    #[allow(dead_code)]
     enabled_tools: Vec<String>,
     /// Known context window size for the model (tokens); None = unknown.
     context_window: Option<u64>,
@@ -1227,8 +1224,120 @@ fn main() -> Result<()> {
                 final_out.exit_code
             );
 
-            // Return JSON so the guest can read both pid and path in one call
-            let response = format!("{{\"pid\":{pid},\"path\":\"{guest_path}\"}}");
+            // Return human-readable summary string
+            let stdout = &final_out.stdout;
+            let byte_count = stdout.len();
+            let line_count = if stdout.is_empty() { 0 } else { stdout.lines().count() };
+            let exit_code = final_out.exit_code.unwrap_or(-1);
+            let response = format!(
+                "Program PID {pid} exited with code {exit_code} and its output \
+                 ({line_count} line(s), {byte_count} byte(s)) was written to file: {guest_path}"
+            );
+            write_memory(&mut caller, out_ptr, out_cap, &response)
+        },
+    )?;
+
+    // ── shell_run_async ───────────────────────────────────────────────────────
+    linker.func_wrap(
+        "host",
+        "shell_run_async",
+        |mut caller: Caller<'_, HostState>,
+         cmd_ptr: i32,
+         cmd_len: i32,
+         args_ptr: i32,
+         args_len: i32,
+         out_ptr: i32,
+         out_cap: i32|
+         -> i32 {
+            let cmd = match read_memory(&mut caller, cmd_ptr, cmd_len) {
+                Ok(c) => c,
+                Err(_) => return -3,
+            };
+            let args_json = match read_memory(&mut caller, args_ptr, args_len) {
+                Ok(j) => j,
+                Err(_) => return -3,
+            };
+            let args: Vec<String> =
+                serde_json::from_str(&args_json).unwrap_or_default();
+
+            // Allow-list check
+            let full_cmd = if args.is_empty() {
+                cmd.clone()
+            } else {
+                format!("{cmd} {}", args.join(" "))
+            };
+            let allowed = caller
+                .data()
+                .shell_allow
+                .iter()
+                .any(|re| re.is_match(&full_cmd));
+            if !allowed {
+                println!(
+                    "[HOST] shell_run_async: command denied by allow-list: {full_cmd:?}"
+                );
+                return -1;
+            }
+
+            // Generate output path
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let hash_input = format!("{full_cmd}\t{now_ms}");
+            let mut hasher = Sha1::new();
+            hasher.update(hash_input.as_bytes());
+            let sha_bytes = hasher.finalize();
+            let sha_hex: String =
+                sha_bytes.iter().take(3).map(|b| format!("{b:02x}")).collect();
+            let vfs_path = format!("tmp/{}_{}.out.json", now_ms, sha_hex);
+            let guest_path = format!("/tmp/{}_{}.out.json", now_ms, sha_hex);
+
+            // Write initial JSON to pending_writes
+            let initial = ShellOut {
+                pid: 0,
+                status: "running".into(),
+                cmd: cmd.clone(),
+                args: args.clone(),
+                started_ms: now_ms,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                elapsed_ms: None,
+                timeout_secs: None,
+            };
+            let initial_json = serde_json::to_string(&initial)
+                .unwrap_or_else(|_| "{\"status\":\"running\"}".into());
+            caller
+                .data_mut()
+                .pending_writes
+                .push((vfs_path, initial_json.into_bytes()));
+
+            println!("[HOST] shell_run_async: spawning {:?} {:?}", cmd, args);
+
+            // Spawn child without waiting
+            let child_result = Command::new(&cmd)
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+
+            let child = match child_result {
+                Err(e) => {
+                    println!("[HOST] shell_run_async: spawn failed: {e}");
+                    return -2;
+                }
+                Ok(c) => c,
+            };
+
+            let pid = child.id();
+            // Register in session — caller can use shell.kill / shell.stdin
+            caller.data_mut().running_processes.insert(pid, child);
+
+            // Return launch confirmation string immediately (no blocking wait)
+            let response = format!(
+                "Program PID {pid} launched and output is streaming to file: {guest_path}"
+            );
             write_memory(&mut caller, out_ptr, out_cap, &response)
         },
     )?;
@@ -3258,16 +3367,18 @@ fn all_tool_names() -> Vec<String> {
         .collect()
 }
 
-#[allow(dead_code)]
 fn build_tools_json(enabled: &[String]) -> String {
     let all: &[(&str, &str, &str)] = &[
         (
             "js_exec",
-            "Execute JavaScript in a sandboxed Boa ES2020 interpreter inside a Wasmtime Wasm guest. \
-Available globals: console.log; fs.readFile(path)->string (throws on not-found); \
-fs.writeFile(path, content) writes to virtual .tcow FS; fs.readdir(dir)->string newline-delimited; \
-require(path) evaluates a .tcow file as JS. The real host filesystem is NOT accessible. \
-No fetch, no Node built-ins.",
+            "Execute server-side JavaScript in a secured environment. \
+            To run a shell command synchronously (blocking), use `console.log(require('shell').runSync('echo', ['hello']))`, which blocks until \
+            the process exits and returns a message like \"Program PID {pid} exited with code {exit_code} \
+            and its output ({line_count} line(s), {byte_count} byte(s)) was written to file: {file}\". \
+            To run a shell command asynchronously (non-blocking), use `console.log(require('shell').run('echo', ['hello']))`, which returns \
+            immediately with \"Program PID {pid} launched and output is streaming to file: {file}\". \
+            You can also read files with `console.log(fs.readFileSync(\"/somefile.txt\"))` and write files with \
+            `fs.writeFileSync(\"/somefile.txt\", \"content\")`",
             r#"{"type":"object","properties":{"code":{"type":"string","description":"JS code to run."}},"required":["code"]}"#,
         ),
         (
@@ -3341,10 +3452,11 @@ No fetch, no Node built-ins.",
         .iter()
         .filter(|(name, _, _)| enabled.contains(&name.to_string()))
         .map(|(name, desc, params)| {
+            let desc_json = serde_json::to_string(desc).unwrap_or_else(|_| "\"\"" .into());
             format!(
-                r#"{{"type":"function","function":{{"name":"{name}","description":"{desc}","parameters":{params}}}}}"#,
+                r#"{{"type":"function","function":{{"name":"{name}","description":{desc_json},"parameters":{params}}}}}"#,
                 name = name,
-                desc = desc.replace('"', "\\\""),
+                desc_json = desc_json,
                 params = params
             )
         })

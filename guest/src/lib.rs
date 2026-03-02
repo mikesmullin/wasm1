@@ -73,6 +73,11 @@ unsafe extern "C" {
         args_ptr: i32, args_len: i32,
         out_ptr: i32, out_cap: i32,
     ) -> i32;
+    fn shell_run_async(
+        cmd_ptr: i32, cmd_len: i32,
+        args_ptr: i32, args_len: i32,
+        out_ptr: i32, out_cap: i32,
+    ) -> i32;
     fn shell_stdin(pid: i32, keys_ptr: i32, keys_len: i32) -> i32;
     fn shell_kill(pid: i32, sig_ptr: i32, sig_len: i32) -> i32;
     // Named tool dispatch — returns JSON {"result":"..."} or {"error":"..."}
@@ -152,8 +157,9 @@ fn vfs_list(dir: &str) -> Result<String, i32> {
 /// AI policy error message shown when the LLM attempts to use child_process.
 const CHILD_PROCESS_POLICY_MSG: &str =
     "AI Policy Error: Use of child_process is prohibited for security reasons. \
-    Please use require('shell').run(cmd, args) which returns an object { pid, path }, \
-    where path points to a JSON file in the virtual filesystem containing { exit_code, stdout, stderr }.";
+    Please use require('shell').runSync(cmd, args) (blocks until exit, returns a summary string) \
+    or require('shell').run(cmd, args) (launches immediately, returns a launch string). \
+    Both write program output to a JSON file in the virtual filesystem readable via require('fs')."; 
 
 // ── child_process policy mock ─────────────────────────────────────────────────
 
@@ -168,21 +174,13 @@ fn js_child_process_policy(
         .into())
 }
 
-// ── shell.run / shell.stdin / shell.kill ──────────────────────────────────────
+// ── shell.runSync / shell.run / shell.stdin / shell.kill ───────────────────
 
-/// js: shell.run(cmd, args?) → { pid, path }  (plain object, safe to `await`)
-/// Also sets shell.lastPid and shell.lastFile on the shell object.
-fn js_shell_run(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
-    let cmd = args
-        .first()
-        .unwrap_or(&JsValue::undefined())
-        .to_string(ctx)?
-        .to_std_string_escaped();
-
-    // Collect the optional args array by iterating the JsObject directly
-    let mut cmd_args: Vec<String> = Vec::new();
-    if let Some(arg1) = args.get(1) {
-        if let Some(obj) = arg1.as_object() {
+/// Collect the optional JS args array into a Vec<String>.
+fn collect_js_args(arg1: Option<&JsValue>, ctx: &mut BoaContext) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(v) = arg1 {
+        if let Some(obj) = v.as_object() {
             let len = obj
                 .get(js_string!("length"), ctx)
                 .ok()
@@ -190,7 +188,7 @@ fn js_shell_run(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsRe
                 .unwrap_or(0);
             for i in 0..len {
                 let item = obj.get(i, ctx).unwrap_or(JsValue::undefined());
-                cmd_args.push(
+                out.push(
                     item.to_string(ctx)
                         .map(|s| s.to_std_string_escaped())
                         .unwrap_or_default(),
@@ -198,11 +196,67 @@ fn js_shell_run(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsRe
             }
         }
     }
+    out
+}
+
+/// js: shell.runSync(cmd, args?) → string
+/// Blocks until the program exits.  Returns:
+///   "Program PID <pid> exited with code <exit_code> and its output
+///    (<lines> line(s), <bytes> byte(s)) was written to file: <path>"
+fn js_shell_run(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
+    let cmd = args
+        .first()
+        .unwrap_or(&JsValue::undefined())
+        .to_string(ctx)?
+        .to_std_string_escaped();
+
+    let cmd_args = collect_js_args(args.get(1), ctx);
     let args_json = serde_json::to_string(&cmd_args).unwrap_or_else(|_| "[]".into());
 
-    let mut out_buf = vec![0u8; 1024];
+    let mut out_buf = vec![0u8; 512];
     let rc = unsafe {
         shell_run(
+            cmd.as_ptr() as i32,
+            cmd.len() as i32,
+            args_json.as_ptr() as i32,
+            args_json.len() as i32,
+            out_buf.as_mut_ptr() as i32,
+            out_buf.len() as i32,
+        )
+    };
+    if rc < 0 {
+        let msg = match rc {
+            -1 => format!(
+                "AI Policy Error: shell.runSync command not in allow-list: {cmd:?}. \
+                 Check the template metadata.shell.allow list."
+            ),
+            -2 => format!("shell.runSync: failed to spawn process: {cmd:?}"),
+            _ => format!("shell.runSync: host error {rc} for command: {cmd:?}"),
+        };
+        return Err(JsNativeError::error().with_message(msg).into());
+    }
+
+    // Host returns the human-readable summary string directly.
+    let response = String::from_utf8_lossy(&out_buf[..rc as usize]).into_owned();
+    Ok(JsValue::from(JsString::from(response.as_str())))
+}
+
+/// js: shell.run(cmd, args?) → string
+/// Launches the program and returns immediately.  Returns:
+///   "Program PID <pid> launched and output is streaming to file: <path>"
+fn js_shell_run_async(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsResult<JsValue> {
+    let cmd = args
+        .first()
+        .unwrap_or(&JsValue::undefined())
+        .to_string(ctx)?
+        .to_std_string_escaped();
+
+    let cmd_args = collect_js_args(args.get(1), ctx);
+    let args_json = serde_json::to_string(&cmd_args).unwrap_or_else(|_| "[]".into());
+
+    let mut out_buf = vec![0u8; 512];
+    let rc = unsafe {
+        shell_run_async(
             cmd.as_ptr() as i32,
             cmd.len() as i32,
             args_json.as_ptr() as i32,
@@ -223,32 +277,9 @@ fn js_shell_run(_this: &JsValue, args: &[JsValue], ctx: &mut BoaContext) -> JsRe
         return Err(JsNativeError::error().with_message(msg).into());
     }
 
-    // Host returns JSON: {"pid": N, "path": "/tmp/..."}
+    // Host returns the human-readable launch string directly.
     let response = String::from_utf8_lossy(&out_buf[..rc as usize]).into_owned();
-    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap_or_default();
-    let pid = parsed["pid"].as_u64().unwrap_or(0);
-    let path = parsed["path"].as_str().unwrap_or("").to_string();
-
-    // Set lastPid and lastFile on the shell object (_this when called as shell.run(...))
-    if let Some(obj) = _this.as_object() {
-        let _ = obj.set(js_string!("lastPid"), JsValue::from(pid as f64), false, ctx);
-        let _ = obj.set(
-            js_string!("lastFile"),
-            JsValue::from(JsString::from(path.as_str())),
-            false,
-            ctx,
-        );
-    }
-
-    // Return a plain (non-thenable) object so that:
-    //   const r = shell.run(...)        → works directly
-    //   const r = await shell.run(...)  → await wraps in already-resolved Promise,
-    //                                     one run_jobs() pass resumes with {pid,path}
-    // If .then existed (thenable), await would create a PromiseResolveThenableJob
-    // that resolves to just the callback arg (the path string), losing the object.
-    let path_json = serde_json::to_string(&path).unwrap_or_else(|_| "\"\"".into());
-    let code = format!("({{pid:{pid},path:{path_json}}})");
-    ctx.eval(Source::from_bytes(code.as_bytes()))
+    Ok(JsValue::from(JsString::from(response.as_str())))
 }
 
 /// js: shell.stdin(pid, sendkeys) → undefined
@@ -485,9 +516,10 @@ fn make_fs_obj(ctx: &mut BoaContext) -> JsValue {
 fn make_shell_obj(ctx: &mut BoaContext) -> JsValue {
     JsValue::from(
         ObjectInitializer::new(ctx)
-            .function(NativeFunction::from_fn_ptr(js_shell_run), js_string!("run"), 2)
-            .function(NativeFunction::from_fn_ptr(js_shell_stdin), js_string!("stdin"), 2)
-            .function(NativeFunction::from_fn_ptr(js_shell_kill), js_string!("kill"), 2)
+            .function(NativeFunction::from_fn_ptr(js_shell_run),       js_string!("runSync"), 2)
+            .function(NativeFunction::from_fn_ptr(js_shell_run_async), js_string!("run"),     2)
+            .function(NativeFunction::from_fn_ptr(js_shell_stdin),     js_string!("stdin"),    2)
+            .function(NativeFunction::from_fn_ptr(js_shell_kill),      js_string!("kill"),     2)
             .build(),
     )
 }
