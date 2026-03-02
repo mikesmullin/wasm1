@@ -253,6 +253,8 @@ struct HostState {
     session_id: String,
     /// Workspace root path used by host-side tools.
     workspace_root: PathBuf,
+    /// Directory the user invoked the binary from (cwd before any cd).
+    invocation_cwd: PathBuf,
     /// Effective merged hooks (template > user > repo).
     hooks: Vec<HookDef>,
     /// Session creation timestamp used in snapshots.
@@ -310,7 +312,15 @@ enum LlmDecision {
     Error { message: String },
 }
 
-fn resolve_template(name: &str) -> Result<PathBuf> {
+/// Display `path` relative to `base` if possible, otherwise absolute.
+fn rel_path(base: &Path, path: &Path) -> String {
+    path.strip_prefix(base)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn resolve_template(name: &str, extra_roots: &[&Path]) -> Result<PathBuf> {
     let p = Path::new(name);
     if p.is_absolute() {
         if p.exists() {
@@ -324,14 +334,19 @@ fn resolve_template(name: &str) -> Result<PathBuf> {
     } else {
         format!("{name}.yaml")
     };
-    let candidates = [PathBuf::from(".agent/templates").join(&basename)];
-    for candidate in &candidates {
+    // Search each root in order: extra roots (e.g. invocation cwd) first, then
+    // workspace root (current directory after cd).
+    let mut roots: Vec<PathBuf> = extra_roots.iter().map(|r| r.to_path_buf()).collect();
+    roots.push(PathBuf::from("."));
+    for root in &roots {
+        let candidate = root.join(".agent/templates").join(&basename);
         if candidate.exists() {
-            return Ok(candidate.clone());
+            return Ok(candidate);
         }
     }
     Err(anyhow!(
-        "template '{name}' not found in .agent/templates/"
+        "template '{name}' not found in .agent/templates/ (searched {} root(s))",
+        roots.len()
     ))
 }
 
@@ -473,12 +488,21 @@ fn copilot_tokens_path() -> PathBuf {
 
 fn load_copilot_tokens() -> CopilotTokens {
     let path = copilot_tokens_path();
+    let abs = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
     if path.exists() {
         if let Ok(content) = fs::read_to_string(&path) {
-            if let Ok(tokens) = serde_yaml::from_str(&content) {
-                return tokens;
+            match serde_yaml::from_str(&content) {
+                Ok(tokens) => {
+                    println!("[HOST] Loaded tokens from {}", abs.display());
+                    return tokens;
+                }
+                Err(e) => {
+                    eprintln!("[HOST] Failed to parse {}: {e}", abs.display());
+                }
             }
         }
+    } else {
+        println!("[HOST] No tokens file at {}", abs.display());
     }
     CopilotTokens::default()
 }
@@ -691,7 +715,8 @@ fn lookup_model_context_window(model: &str) -> Option<u64> {
 }
 
 fn main() -> Result<()> {
-    let _ = from_filename(".env");
+    // Capture where the user actually ran the command from, before any cd.
+    let invocation_cwd = env::current_dir().context("failed to get current directory")?;
 
     // Parse CLI args:
     //   wasm1 cron once|watch
@@ -741,9 +766,28 @@ fn main() -> Result<()> {
     let prompt =
         prompt.ok_or_else(|| anyhow!("usage: cargo run -- [clean|cron <once|watch>|-t <template>] \"<prompt>\""))?;
 
+    // Resolve the workspace root (walks up from binary's real path if needed)
+    // and cd there so .agent/, .tokens.yaml, .env, guest.wasm etc. all resolve
+    // correctly regardless of where the binary was invoked from.
+    let workspace_root = resolve_workspace_root()?;
+    if workspace_root != invocation_cwd {
+        println!("[HOST] Workspace root: {}", rel_path(&invocation_cwd, &workspace_root));
+    }
+    env::set_current_dir(&workspace_root)
+        .with_context(|| format!("failed to set working directory to {}", workspace_root.display()))?;
+    // Load .env from workspace root (now the cwd).
+    let _ = from_filename(".env");
+
+    // For template lookup: search invocation cwd first, then workspace root.
+    let extra_roots: Vec<&Path> = if invocation_cwd != workspace_root {
+        vec![invocation_cwd.as_path()]
+    } else {
+        vec![]
+    };
+
     // Load template allow-list if -t was supplied
     let (shell_allow, shell_timeout, system_prompt, max_steps, validate_fn, max_validation_fails, enabled_tools, template_context_window, template_hooks, template_description, template_labels, template_model, ignore_ssl) = if let Some(ref name) = template_name {
-        let path = resolve_template(name)?;
+        let path = resolve_template(name, &extra_roots)?;
         println!("[HOST] Using template: {}", path.display());
         load_template(&path)?
     } else {
@@ -1698,15 +1742,17 @@ fn main() -> Result<()> {
     let session_id = format!("{session_ts}-{session_pid}-{session_rand}");
     println!("[HOST] Session: {session_id}");
     let session_created = now_stamp();
-    let workspace_root = env::current_dir().context("failed to get current workspace directory")?;
 
-    let tcow_dir = Path::new(".agent/fs");
-    std::fs::create_dir_all(tcow_dir).context("failed to create .agent/fs/")?;
-    let tcow_path = format!(".agent/fs/{session_id}.tcow");
-    println!("[HOST] TCOW virtual FS: {tcow_path}");
+    // .agent/fs is local to the invocation cwd (each working directory gets its own vfs)
+    let tcow_dir = invocation_cwd.join(".agent/fs");
+    std::fs::create_dir_all(&tcow_dir).context("failed to create .agent/fs/")?;
+    let tcow_path_buf = tcow_dir.join(format!("{session_id}.tcow"));
+    println!("[HOST] TCOW virtual FS: {}", rel_path(&invocation_cwd, &tcow_path_buf));
+    let tcow_path = tcow_path_buf.to_string_lossy().into_owned();
 
-    let sessions_dir = Path::new(".agent/sessions");
-    std::fs::create_dir_all(sessions_dir).context("failed to create .agent/sessions/")?;
+    // .agent/sessions resolves relative to invocation cwd
+    let sessions_dir = invocation_cwd.join(".agent/sessions");
+    std::fs::create_dir_all(&sessions_dir).context("failed to create .agent/sessions/")?;
 
     let wasi = WasiCtxBuilder::new().inherit_stdio().build();
     let state = HostState {
@@ -1732,6 +1778,7 @@ fn main() -> Result<()> {
         context_window,
         session_id,
         workspace_root,
+        invocation_cwd,
         hooks: effective_hooks,
         session_created,
         session_status: "pending".to_string(),
@@ -1774,7 +1821,7 @@ fn main() -> Result<()> {
         if !state.pending_writes.is_empty() {
             let tcow_path = &state.tcow_path;
             let writes = &state.pending_writes;
-            println!("[HOST] Flushing {} write(s) to {tcow_path}", writes.len());
+            println!("[HOST] Flushing {} write(s) to {}", writes.len(), rel_path(&state.invocation_cwd, Path::new(tcow_path)));
             if Path::new(tcow_path).exists() {
                 TcowFile::append_delta(tcow_path, writes, &[])
                     .context("failed to append delta layer to .tcow")?;
@@ -1830,12 +1877,15 @@ fn now_stamp() -> String {
 }
 
 fn looks_like_workspace_root(dir: &Path) -> bool {
-    dir.join(".agent").exists()
+    // Require .agent/templates/ — the presence of just .agent/ is not strong
+    // enough since agent runs create .agent/fs/ in the invocation cwd.
+    dir.join(".agent/templates").exists()
         || dir.join("Cargo.toml").exists()
         || dir.join("config.yaml").exists()
 }
 
-fn resolve_workspace_root_for_cron() -> Result<PathBuf> {
+fn resolve_workspace_root() -> Result<PathBuf> {
+    // 1. Explicit env override
     if let Ok(from_env) = env::var("WASM1_WORKSPACE_ROOT") {
         let p = PathBuf::from(from_env);
         if looks_like_workspace_root(&p) {
@@ -1843,20 +1893,23 @@ fn resolve_workspace_root_for_cron() -> Result<PathBuf> {
         }
     }
 
-    let cwd = env::current_dir().context("failed to get current directory")?;
-    if looks_like_workspace_root(&cwd) {
-        return Ok(cwd);
-    }
-
+    // 2. Derive from binary location: {workspace}/target/{profile}/wasm1
+    //    Canonicalize first to resolve any symlink (e.g. ~/.cargo/bin/wasm1).
     if let Ok(exe) = env::current_exe() {
         let exe_resolved = fs::canonicalize(&exe).unwrap_or(exe);
-        for ancestor in exe_resolved.ancestors() {
-            if looks_like_workspace_root(ancestor) {
-                return Ok(ancestor.to_path_buf());
+        // exe_resolved = .../workspace/target/release/wasm1
+        //   .parent()  = .../workspace/target/release
+        //   .parent()  = .../workspace/target
+        //   .parent()  = .../workspace
+        if let Some(workspace) = exe_resolved.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+            if looks_like_workspace_root(workspace) {
+                return Ok(workspace.to_path_buf());
             }
         }
     }
 
+    // 3. cwd fallback (e.g. `cargo run` where the binary lives inside the workspace)
+    let cwd = env::current_dir().context("failed to get current directory")?;
     Ok(cwd)
 }
 
@@ -1909,14 +1962,14 @@ fn c24(text: &str, r: u8, g: u8, b: u8) -> String {
 }
 
 fn run_cron(mode: &str, template_name: Option<&str>, verbose: bool) -> Result<()> {
-    let workspace_root = resolve_workspace_root_for_cron()?;
+    let workspace_root = resolve_workspace_root()?;
     env::set_current_dir(&workspace_root)
         .with_context(|| format!("failed to set current dir to {}", workspace_root.display()))?;
     let cron_interval_ms = load_or_init_cron_interval_ms(&workspace_root)?;
     let session_id = format!("cron-{}-{}", std::process::id(), now_millis());
     let global_hooks = load_global_hooks()?;
     let template_hooks = if let Some(name) = template_name {
-        let path = resolve_template(name)?;
+        let path = resolve_template(name, &[])?;
         read_hooks_from_template_file(&path)?
     } else {
         load_all_template_hooks()?
@@ -2642,7 +2695,7 @@ fn merge_json_object(base: &mut serde_json::Value, extra: &serde_json::Value) {
 
 fn session_snapshot_path(state: &HostState) -> PathBuf {
     state
-        .workspace_root
+        .invocation_cwd
         .join(".agent/sessions")
         .join(format!("{}.yaml", state.session_id))
 }
@@ -2668,23 +2721,31 @@ fn clear_dir(path: &Path) -> Result<u64> {
 }
 
 fn run_clean() -> Result<()> {
-    let workspace_root = env::current_dir().context("failed to get current directory")?;
-    let fs_dir = workspace_root.join(".agent/fs");
-    let msgq_dir = workspace_root.join(".agent/msgq");
-    let sessions_dir = workspace_root.join(".agent/sessions");
+    let invocation_cwd = env::current_dir().context("failed to get current directory")?;
+    let workspace_root = resolve_workspace_root()?;
 
-    fs::create_dir_all(&fs_dir).with_context(|| format!("failed to create {}", fs_dir.display()))?;
-    fs::create_dir_all(&msgq_dir).with_context(|| format!("failed to create {}", msgq_dir.display()))?;
-    fs::create_dir_all(&sessions_dir)
-        .with_context(|| format!("failed to create {}", sessions_dir.display()))?;
+    // Collect the roots to clean, cwd first, then workspace root.
+    // Deduplicate so we don't double-clean when cwd == workspace root.
+    let mut roots: Vec<&Path> = vec![invocation_cwd.as_path()];
+    if workspace_root != invocation_cwd {
+        roots.push(workspace_root.as_path());
+    }
 
-    let removed_fs = clear_dir(&fs_dir)?;
-    let removed_msgq = clear_dir(&msgq_dir)?;
-    let removed_sessions = clear_dir(&sessions_dir)?;
+    for root in roots {
+        let fs_dir = root.join(".agent/fs");
+        let msgq_dir = root.join(".agent/msgq");
+        let sessions_dir = root.join(".agent/sessions");
 
-    println!(
-        "[HOST] clean complete: .agent/fs={removed_fs}, .agent/msgq={removed_msgq}, .agent/sessions={removed_sessions}"
-    );
+        let removed_fs = if fs_dir.exists() { clear_dir(&fs_dir)? } else { 0 };
+        let removed_msgq = if msgq_dir.exists() { clear_dir(&msgq_dir)? } else { 0 };
+        let removed_sessions = if sessions_dir.exists() { clear_dir(&sessions_dir)? } else { 0 };
+
+        println!(
+            "[HOST] clean {}: .agent/fs={removed_fs}, .agent/msgq={removed_msgq}, .agent/sessions={removed_sessions}",
+            root.display(),
+        );
+    }
+
     Ok(())
 }
 
