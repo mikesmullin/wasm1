@@ -450,9 +450,219 @@ fn parse_provider_model(raw_model: &str) -> (ModelProvider, String) {
     (ModelProvider::Xai, raw_model.to_string())
 }
 
-fn resolve_copilot_github_token() -> Result<String> {
-    env::var("COPILOT_API_KEY")
-        .context("copilot provider requires COPILOT_API_KEY")
+// ── Copilot Internal API Auth ─────────────────────────────────────────────────
+
+/// Copilot auth config (mimics VS Code behavior)
+const COPILOT_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
+const COPILOT_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
+const COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98"; // VS Code client ID
+const COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
+const COPILOT_API_URL: &str = "https://api.githubcopilot.com";
+const COPILOT_USER_AGENT: &str = "GitHubCopilot/1.155.0";
+const COPILOT_EDITOR_VERSION: &str = "vscode/1.85.1";
+const COPILOT_EDITOR_PLUGIN_VERSION: &str = "copilot/1.155.0";
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct CopilotTokens {
+    github_token: Option<String>,
+    copilot_token: Option<String>,
+    expires_at: Option<u64>,
+    api_url: Option<String>,
+}
+
+fn copilot_tokens_path() -> PathBuf {
+    PathBuf::from(".tokens.yaml")
+}
+
+fn load_copilot_tokens() -> CopilotTokens {
+    let path = copilot_tokens_path();
+    if path.exists() {
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Ok(tokens) = serde_yaml::from_str(&content) {
+                return tokens;
+            }
+        }
+    }
+    CopilotTokens::default()
+}
+
+fn save_copilot_tokens(tokens: &CopilotTokens) -> Result<()> {
+    let path = copilot_tokens_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = serde_yaml::to_string(tokens)?;
+    fs::write(&path, content)?;
+    Ok(())
+}
+
+/// Start GitHub device OAuth flow, returns (device_code, user_code, verification_uri, interval)
+fn copilot_start_device_flow(client: &Client) -> Result<(String, String, String, u64)> {
+    #[derive(Deserialize)]
+    struct DeviceFlowResponse {
+        device_code: String,
+        user_code: String,
+        verification_uri: String,
+        interval: u64,
+    }
+
+    let resp = client
+        .post(COPILOT_DEVICE_CODE_URL)
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .header("User-Agent", COPILOT_USER_AGENT)
+        .json(&serde_json::json!({
+            "client_id": COPILOT_CLIENT_ID,
+            "scope": "read:user"
+        }))
+        .send()
+        .context("failed to start device flow")?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow!("device flow failed: {}", resp.status()));
+    }
+
+    let data: DeviceFlowResponse = resp.json().context("failed to parse device flow response")?;
+    Ok((data.device_code, data.user_code, data.verification_uri, data.interval))
+}
+
+/// Poll for GitHub access token after user authenticates
+fn copilot_poll_for_access_token(client: &Client, device_code: &str, interval: u64) -> Result<String> {
+    let max_attempts = 180; // ~15 minutes with 5s interval
+    for attempt in 1..=max_attempts {
+        std::thread::sleep(Duration::from_secs(interval));
+
+        let resp = client
+            .post(COPILOT_ACCESS_TOKEN_URL)
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .header("User-Agent", COPILOT_USER_AGENT)
+            .json(&serde_json::json!({
+                "client_id": COPILOT_CLIENT_ID,
+                "device_code": device_code,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
+            }))
+            .send()
+            .context("failed to poll for access token")?;
+
+        #[derive(Deserialize)]
+        struct TokenResponse {
+            access_token: Option<String>,
+            error: Option<String>,
+            error_description: Option<String>,
+        }
+
+        let data: TokenResponse = resp.json().context("failed to parse token response")?;
+
+        if let Some(token) = data.access_token {
+            return Ok(token);
+        }
+        if let Some(err) = data.error {
+            if err == "authorization_pending" {
+                if attempt % 6 == 0 {
+                    eprintln!("[HOST] Still waiting for GitHub authorization... ({attempt}/{max_attempts})");
+                }
+                continue;
+            }
+            return Err(anyhow!("auth failed: {}", data.error_description.unwrap_or(err)));
+        }
+    }
+    Err(anyhow!("authentication timed out after 15 minutes"))
+}
+
+/// Exchange GitHub token for Copilot internal token
+fn copilot_get_token(client: &Client, github_token: &str) -> Result<(String, u64, String)> {
+    let resp = client
+        .get(COPILOT_TOKEN_URL)
+        .header("Accept", "application/json")
+        .header("Authorization", format!("Bearer {github_token}"))
+        .header("User-Agent", COPILOT_USER_AGENT)
+        .header("Editor-Version", COPILOT_EDITOR_VERSION)
+        .header("Editor-Plugin-Version", COPILOT_EDITOR_PLUGIN_VERSION)
+        .send()
+        .context("failed to get Copilot token")?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow!("failed to get Copilot token: {}", resp.status()));
+    }
+
+    #[derive(Deserialize)]
+    struct CopilotTokenResponse {
+        token: String,
+        expires_at: u64,
+        endpoints: Option<CopilotEndpoints>,
+    }
+    #[derive(Deserialize)]
+    struct CopilotEndpoints {
+        api: Option<String>,
+    }
+
+    let data: CopilotTokenResponse = resp.json().context("failed to parse Copilot token response")?;
+    let api_url = data.endpoints.and_then(|e| e.api).unwrap_or_else(|| COPILOT_API_URL.to_string());
+    Ok((data.token, data.expires_at, api_url))
+}
+
+/// Resolve Copilot authentication using internal API (like VS Code)
+fn resolve_copilot_internal_auth(client: &Client) -> Result<(String, String)> {
+    let mut tokens = load_copilot_tokens();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+    // 1. Valid Copilot token exists
+    if let (Some(ref copilot_token), Some(expires_at)) = (&tokens.copilot_token, tokens.expires_at) {
+        if expires_at > now + 60 {
+            let api_url = tokens.api_url.clone().unwrap_or_else(|| COPILOT_API_URL.to_string());
+            println!("[HOST] Using cached Copilot token (expires in {}s)", expires_at - now);
+            return Ok((copilot_token.clone(), api_url));
+        }
+    }
+
+    // 2. Refresh with GitHub token
+    if let Some(ref github_token) = tokens.github_token {
+        println!("[HOST] Refreshing Copilot token...");
+        match copilot_get_token(client, github_token) {
+            Ok((copilot_token, expires_at, api_url)) => {
+                tokens.copilot_token = Some(copilot_token.clone());
+                tokens.expires_at = Some(expires_at);
+                tokens.api_url = Some(api_url.clone());
+                let _ = save_copilot_tokens(&tokens);
+                println!("[HOST] ✅ Copilot token refreshed");
+                return Ok((copilot_token, api_url));
+            }
+            Err(e) => {
+                eprintln!("[HOST] ⚠ Failed to refresh Copilot token: {e}");
+                // Clear invalid GitHub token
+                tokens.github_token = None;
+                let _ = save_copilot_tokens(&tokens);
+            }
+        }
+    }
+
+    // 3. Fresh authentication via device flow
+    println!("[HOST] Starting Copilot authentication via GitHub device flow...");
+    let (device_code, user_code, verification_uri, interval) = copilot_start_device_flow(client)?;
+
+    eprintln!("\n╔══════════════════════════════════════════════════════════════╗");
+    eprintln!("║             GITHUB COPILOT AUTHENTICATION                    ║");
+    eprintln!("╠══════════════════════════════════════════════════════════════╣");
+    eprintln!("║                                                              ║");
+    eprintln!("║  📋 Visit: {:<47} ║", verification_uri);
+    eprintln!("║  🔑 Enter code: {:<42} ║", user_code);
+    eprintln!("║                                                              ║");
+    eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
+
+    let github_token = copilot_poll_for_access_token(client, &device_code, interval)?;
+    println!("[HOST] ✅ GitHub authenticated!");
+
+    let (copilot_token, expires_at, api_url) = copilot_get_token(client, &github_token)?;
+    println!("[HOST] ✅ Copilot token obtained!");
+
+    tokens.github_token = Some(github_token);
+    tokens.copilot_token = Some(copilot_token.clone());
+    tokens.expires_at = Some(expires_at);
+    tokens.api_url = Some(api_url.clone());
+    save_copilot_tokens(&tokens)?;
+
+    Ok((copilot_token, api_url))
 }
 
 /// Query the xAI models endpoint to discover the context window for `model`.
@@ -563,8 +773,9 @@ fn main() -> Result<()> {
             (key, "https://api.x.ai".to_string(), ctx)
         }
         ModelProvider::Copilot => {
-            let token = resolve_copilot_github_token()?;
-            (token, "https://models.github.ai".to_string(), template_context_window)
+            // Use VS Code-style internal API authentication
+            let (token, api_url) = resolve_copilot_internal_auth(&client)?;
+            (token, api_url, template_context_window)
         }
     };
     let provider_name = match provider {
@@ -3157,12 +3368,15 @@ fn format_tool_result(result_json: &str) -> String {
     }
 }
 
+/// Normalize model name for GitHub Copilot internal API.
+/// The internal API (api.githubcopilot.com) accepts model names directly
+/// without publisher prefixes (e.g., "gpt-4o", "claude-sonnet-4").
 fn normalize_copilot_model_id(model_name: &str) -> String {
-    if model_name.contains('/') {
-        model_name.to_string()
-    } else {
-        format!("openai/{model_name}")
+    // Strip any publisher prefix if present
+    if let Some(idx) = model_name.find('/') {
+        return model_name[idx + 1..].to_string();
     }
+    model_name.to_string()
 }
 
 fn usage_thought_tokens(usage: &serde_json::Value) -> u64 {
@@ -3228,7 +3442,7 @@ fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
             "xAI",
         ),
         ModelProvider::Copilot => (
-            format!("{}/inference/chat/completions", state.provider_api_url.trim_end_matches('/')),
+            format!("{}/chat/completions", state.provider_api_url.trim_end_matches('/')),
             "Copilot",
         ),
     };
@@ -3243,9 +3457,13 @@ fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
             .bearer_auth(&state.api_key)
             .json(&body);
         if state.provider == ModelProvider::Copilot {
+            // VS Code-style Copilot headers
             req_builder = req_builder
-                .header("Accept", "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28");
+                .header("Editor-Version", COPILOT_EDITOR_VERSION)
+                .header("Editor-Plugin-Version", COPILOT_EDITOR_PLUGIN_VERSION)
+                .header("User-Agent", COPILOT_USER_AGENT)
+                .header("Copilot-Integration-Id", "vscode-chat")
+                .header("OpenAI-Intent", "conversation-panel");
         }
         match req_builder.send() {
             Ok(resp) => {
