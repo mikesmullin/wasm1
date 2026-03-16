@@ -93,29 +93,134 @@ Virtual filesystem access is exposed to JS code via Boa native objects that call
 
 ## Building
 
-**Prerequisites:** Rust stable, `wasm32-wasip1` target, and provider auth:
+**Prerequisites:**
+- Rust stable (1.70+)
+- `wasm32-wasip1` target installed via `rustup target add wasm32-wasip1`
+- Provider authentication via environment (see [Authentication](#authentication) below)
+- Vendored dependencies initialized: `git submodule update --init --recursive` (includes `vendor/tcow`)
 
-- Initialize vendored dependencies: `git submodule update --init --recursive` (includes `vendor/tcow`).
-
-- xAI: `XAI_API_KEY`
-- Copilot: `COPILOT_API_KEY`
+### Quick Start
 
 ```bash
-# Add the Wasm target (once)
+# Add the Wasm target (one-time setup)
 rustup target add wasm32-wasip1
 
-# Build the guest module
-cargo build --manifest-path guest/Cargo.toml --target wasm32-wasip1
+# Build everything (host + guest) with default configuration
+cargo build
 
-# Build and run the host (xAI default model)
+# Run a simple test query
 XAI_API_KEY=your_key cargo run -- "What is the capital of Japan?"
-
-# Build and run with a Copilot-prefixed template model
-# (template metadata.model: copilot:gpt-4o)
-GITHUB_TOKEN=your_github_token cargo run -- -t your-template "Summarize this repository"
 ```
 
-The host automatically rebuilds the guest if `guest/target/wasm32-wasip1/debug/guest.wasm` is stale. The virtual filesystem is stored in `agent.tcow` (path overridable via `TCOW_PATH` env var); it is created on the first write and extended with a new delta layer on each subsequent run.
+### Build Details
+
+```bash
+# Build guest module explicitly (auto-triggered by cargo run/build but useful for diagnostics)
+cargo build --manifest-path guest/Cargo.toml --target wasm32-wasip1 --release
+
+# Build host in release mode (optimized, slower compile)
+cargo build --release
+
+# Run tests
+cargo test
+
+# Type-check without rebuilding (fast feedback loop)
+cargo check && cargo check --manifest-path guest/Cargo.toml --target wasm32-wasip1
+```
+
+**Key behaviors:**
+- Host automatically rebuilds guest if `guest/target/wasm32-wasip1/debug/guest.wasm` is stale.
+- Virtual filesystem stored in `agent.tcow` (overridable via `TCOW_PATH` env var); created on first write, extended with new delta layer each run.
+- Session YAML persisted under `.agent/sessions/` (tracked state for manual approval workflows).
+
+---
+
+## Installation
+
+### Development (Workspace-Based)
+
+For development and testing from within the workspace:
+
+```bash
+# From workspace root, with cargo run
+cd /workspace/tmp/wasm1
+XAI_API_KEY=your_key cargo run -- "Your prompt here"
+
+# Or build once and use the binary directly
+cargo build --release
+./target/release/wasm1 "Your prompt here"
+```
+
+### System-Wide Installation
+
+To install wasm1 to your PATH for use from any directory:
+
+```bash
+# Install to ~/.cargo/bin (added to PATH by Rust installer)
+cargo install --path . --force
+
+# Verify installation
+which wasm1
+wasm1 --help
+```
+
+**⚠️ Workspace Discovery for Globally Installed Binary**
+
+When wasm1 is installed globally (via `cargo install`), it must locate your workspace root to find `.env` and session files. The binary uses three fallback strategies (in order):
+
+1. **Environment variable override** (recommended for single workspace):
+   ```bash
+   export WASM1_WORKSPACE_ROOT=/workspace/tmp/wasm1
+   wasm1 "Your prompt"
+   ```
+
+2. **Symlink approach** (recommended if used before; matches binary layout expectations):
+   ```bash
+   # Symlink the binary that your shell actually resolves for `wasm1`.
+   # Common default for Rust installs is ~/.cargo/bin/wasm1.
+   ln -sf /workspace/tmp/wasm1/target/release/wasm1 ~/.cargo/bin/wasm1
+
+   # If you prefer ~/.local/bin, ensure it appears before ~/.cargo/bin in PATH.
+   # Then symlink there instead:
+   # ln -sf /workspace/tmp/wasm1/target/release/wasm1 ~/.local/bin/wasm1
+
+   # Verify workspace was discovered
+   wasm1 "Your prompt"  # Should find .env and .agent/ correctly
+   ```
+
+3. **Current working directory fallback** (if in workspace root):
+   ```bash
+   cd /workspace/tmp/wasm1
+   wasm1 "Your prompt"
+   ```
+
+To automate workspace discovery, add to your shell rc file (`~/.bashrc`, `~/.zshrc`, etc.):
+```bash
+export WASM1_WORKSPACE_ROOT=/workspace/tmp/wasm1
+```
+
+---
+
+## Authentication
+
+Provide API keys via `.env` file at workspace root or environment variables:
+
+```bash
+# .env file (recommended — .gitignore'd, auto-loaded)
+XAI_API_KEY=sk-...
+GITHUB_TOKEN=ghp_...
+```
+
+Or set environment variables directly:
+```bash
+export XAI_API_KEY=sk-...
+export GITHUB_TOKEN=ghp_...
+cargo run -- "Your prompt"
+```
+
+**Supported providers:**
+- **xAI (default)**: Requires `XAI_API_KEY`. Uses `grok-4-1-fast-reasoning` by default.
+- **GitHub Copilot**: Requires `GITHUB_TOKEN`. Use template with `copilot:gpt-4o` (or similar) as model prefix.
 
 ---
 

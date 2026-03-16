@@ -96,37 +96,37 @@ metadata:
 
 ---
 
-## EJS in `system_prompt`
+## MiniJinja in `system_prompt`
 
-`spec.system_prompt` is rendered using [EJS](https://ejs.co/) before being sent to the model.
+`spec.system_prompt` is rendered using [MiniJinja](https://github.com/mitsuhiko/minijinja) before being sent to the model.
 This allows dynamic content, file includes, and shell output to be embedded in prompts.
 
 ### Available helpers
 
 | Name | Signature | Returns | Description |
 |---|---|---|---|
-| `readStdin` | `readStdin()` | `Promise<string>` | Reads stdin content when `-i` (read stdin) flag is passed on the CLI. |
-| `shell` | `shell(cmd: string)` | `string` | Runs `cmd` via `execSync` and returns trimmed stdout. |
-| `includePrompt` | `includePrompt(path: string)` | `string` | Reads and returns a workspace-relative file. Path traversal outside workspace is rejected. Circular includes and missing files fail fast. |
-| `process` | — | object | The host `process` object (`cwd`, `env`, `platform`, …). |
-| `os` | — | object | Host `os` module (`release()`, etc.). |
+| `readStdin` | `readStdin()` | `string` | Reads stdin content when `-i` (read stdin) flag is passed on the CLI. |
+| `shell` | `shell(cmd: string)` | `string` | Runs `cmd` via shell and returns trimmed stdout. |
+| `includePrompt` | `includePrompt(path: string)` | `string` | Reads and returns a workspace-relative file. Path traversal outside workspace is rejected. |
+| `process` | — | object | Host process info (`cwd`, `env`, `platform`, `shell`). |
+| `os` | — | object | Host OS info (`release`). |
 
-### EJS example
+### MiniJinja example
 
 ```yaml
 spec:
   system_prompt: |
-    Today: <%= new Date().toISOString() %>
-    CWD: <%= process.cwd() %>
+    CWD: {{ process.cwd }}
+    Platform: {{ process.platform }}
 
     Shared rules:
-    <%- includePrompt('.agent/snippets/shared/rules.md') %>
+    {{ includePrompt('.agent/snippets/shared/rules.md') }}
 
     Tool help:
-    <%= shell('cat .agent/snippets/tool-help.md') %>
+    {{ shell('cat .agent/snippets/tool-help.md') }}
 
     Conversation history:
-    <%= await readStdin() %>
+    {{ readStdin() }}
 ```
 
 ---

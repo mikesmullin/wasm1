@@ -1,13 +1,14 @@
 use anyhow::{anyhow, Context, Result};
 use dotenvy::from_filename;
+use minijinja::{Environment as MiniJinjaEnv, context as mj_context};
 use regex::Regex;
 use reqwest::blocking::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,6 +53,7 @@ struct TemplateMetadata {
     validate: Option<String>,
     max_validation_fails: Option<u32>,
     shell: Option<ShellConfig>,
+    auto_approve: Option<Vec<AutoApproveRuleDef>>,
     /// Explicit tool allowlist for the session. Absent = all tools.
     tools: Option<Vec<String>>,
     /// If true, disable SSL certificate validation for HTTP requests.
@@ -62,6 +64,19 @@ struct TemplateMetadata {
 struct ShellConfig {
     allow: Option<Vec<String>>,
     timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct AutoApproveRuleDef {
+    tool: String,
+    #[serde(default)]
+    pattern: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AutoApproveRule {
+    tool: String,
+    pattern: Option<Regex>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -178,9 +193,43 @@ struct SessionMetadata {
     labels: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
-    #[serde(rename = "lastTransition")]
     #[serde(skip_serializing_if = "Option::is_none")]
     last_transition: Option<SessionTransition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionSnapshotIn {
+    metadata: SessionMetadataIn,
+    spec: SessionSpecIn,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionMetadataIn {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    created: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    tools: Vec<String>,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionSpecIn {
+    #[serde(default)]
+    system_prompt: Option<String>,
+    #[serde(default)]
+    messages: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,7 +244,14 @@ struct SessionTransition {
 struct SessionSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     system_prompt: Option<String>,
-    messages: Vec<serde_json::Value>,
+    messages: Vec<SessionMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionMessage {
+    role: String,
+    verbatim: serde_json::Value,
+    meta: serde_json::Value,
 }
 
 // ── Shell output YAML ─────────────────────────────────────────────────────────
@@ -247,6 +303,8 @@ struct HostState {
     max_validation_fails: Option<u32>,
     /// Tool names available to the LLM (controls tools_json).
     enabled_tools: Vec<String>,
+    /// Template-based auto-approval rules for tool invocations.
+    auto_approve_rules: Vec<AutoApproveRule>,
     /// Known context window size for the model (tokens); None = unknown.
     context_window: Option<u64>,
     /// Canonical session id `<timestampMs>-<pid>-<hex4>`.
@@ -259,17 +317,29 @@ struct HostState {
     hooks: Vec<HookDef>,
     /// Session creation timestamp used in snapshots.
     session_created: String,
-    /// Current session status for transition tracking.
-    session_status: String,
+    /// Current session state for transition tracking.
+    session_state: String,
     /// Template display name used in session snapshots.
     template_name: String,
     /// Optional template description for session snapshots.
     template_description: Option<String>,
     /// Template labels for session snapshots.
     template_labels: Vec<String>,
+    /// Seeded history restored from session YAML on resume.
+    seed_history: Vec<HistoryEntry>,
+    /// Seeded validation feedback restored from session YAML on resume.
+    seed_validation_feedback: Vec<String>,
+    /// Seeded logical step restored from session YAML on resume.
+    seed_step: u32,
+    /// Seeded ordered messages restored from session YAML on resume.
+    seed_messages: Vec<SessionMessage>,
+    /// Tool calls approved in session YAML but not yet executed (no tool result entry yet).
+    seed_pending_calls: Vec<PendingToolCall>,
+    /// Resume-mode gate: true when waiting for manual approvals and no executable work exists.
+    seed_blocked_on_approval: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct HistoryEntry {
     tool_call_id: String,
     tool_name: String,
@@ -277,39 +347,68 @@ struct HistoryEntry {
     result_json: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct GuestRequest {
     prompt: String,
     history: Vec<HistoryEntry>,
     #[serde(default)]
     validation_feedback: Vec<String>,
     step: u32,
+    #[serde(default)]
+    unsent_tool_result_ids: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PendingToolCall {
+    tool: String,
+    tool_call_id: String,
+    #[serde(default)]
+    args: serde_json::Value,
+    assistant_msg_json: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionSeedPayload {
+    prompt: String,
+    history: Vec<HistoryEntry>,
+    validation_feedback: Vec<String>,
+    step: u32,
+    pending_tool_calls: Vec<PendingToolCall>,
+    blocked_on_approval: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ToolInvocation {
+    tool: String,
+    tool_call_id: String,
+    #[serde(default)]
+    args: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum LlmDecision {
     #[serde(rename = "tool_call")]
     ToolCall {
-        tool: String,
-        /// xAI tool call ID — stored in history for role:tool reply.
-        tool_call_id: String,
+        tool_calls: Vec<ToolInvocation>,
         /// Serialized assistant message (with tool_calls) to replay in history.
         assistant_msg_json: String,
-        /// JS source — only for js_exec.
-        #[serde(default)]
-        code: Option<String>,
-        /// Structured args — for non-js_exec tools.
-        #[serde(default)]
-        args: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        perf: Option<serde_json::Value>,
     },
     #[serde(rename = "final")]
     Final {
         answer: String,
         thought: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        perf: Option<serde_json::Value>,
     },
     #[serde(rename = "error")]
-    Error { message: String },
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        perf: Option<serde_json::Value>,
+    },
 }
 
 /// Display `path` relative to `base` if possible, otherwise absolute.
@@ -350,7 +449,7 @@ fn resolve_template(name: &str, extra_roots: &[&Path]) -> Result<PathBuf> {
     ))
 }
 
-fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>, Option<u32>, Option<String>, Option<u32>, Vec<String>, Option<u64>, Vec<HookDef>, Option<String>, Vec<String>, Option<String>, bool)> {
+fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>, Option<u32>, Option<String>, Option<u32>, Vec<String>, Vec<AutoApproveRule>, Option<u64>, Vec<HookDef>, Option<String>, Vec<String>, Option<String>, bool)> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read template: {}", path.display()))?;
     let template: Template = serde_yaml::from_str(&content)
@@ -377,6 +476,26 @@ fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>
     let regexes = allow_patterns
         .iter()
         .map(|pat| Regex::new(pat).with_context(|| format!("invalid regex in template: {pat}")))
+        .collect::<Result<Vec<_>>>()?;
+    let auto_defs = template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.auto_approve.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let auto_approve_rules = auto_defs
+        .iter()
+        .map(|rule| {
+            let compiled = rule
+                .pattern
+                .as_deref()
+                .map(|pat| Regex::new(pat).with_context(|| format!("invalid auto_approve regex in template: {pat}")))
+                .transpose()?;
+            Ok(AutoApproveRule {
+                tool: rule.tool.clone(),
+                pattern: compiled,
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
     let mut system_prompt = template.spec.as_ref().and_then(|s| s.system_prompt.clone());
     let max_steps = template
@@ -449,7 +568,7 @@ fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>
         template_context_window.map(|n| format!("{n}")).unwrap_or_else(|| "unset".into()),
         ignore_ssl,
     );
-    Ok((regexes, timeout, system_prompt, max_steps, validate_fn, max_validation_fails, tools, template_context_window, hooks, description, labels, template_model, ignore_ssl))
+    Ok((regexes, timeout, system_prompt, max_steps, validate_fn, max_validation_fails, tools, auto_approve_rules, template_context_window, hooks, description, labels, template_model, ignore_ssl))
 }
 
 fn parse_provider_model(raw_model: &str) -> (ModelProvider, String) {
@@ -719,7 +838,7 @@ fn main() -> Result<()> {
     let invocation_cwd = env::current_dir().context("failed to get current directory")?;
 
     // Parse CLI args:
-    //   wasm1 cron once|watch
+    //   wasm1 cron [once]
     //   wasm1 [-t <template>] <prompt>
     let all_args: Vec<String> = env::args().skip(1).collect();
     if all_args.first().map(String::as_str) == Some("cron") {
@@ -731,7 +850,7 @@ fn main() -> Result<()> {
             match all_args[idx].as_str() {
                 "-t" | "--template" => {
                     if idx + 1 >= all_args.len() {
-                        return Err(anyhow!("usage: cargo run -- cron [once|watch] [-t <template>] [-v]"));
+                        return Err(anyhow!("usage: cargo run -- cron [once] [-t <template>] [-v]"));
                     }
                     cron_template = Some(all_args[idx + 1].clone());
                     idx += 2;
@@ -742,7 +861,7 @@ fn main() -> Result<()> {
                 }
                 other => {
                     return Err(anyhow!(
-                        "unknown cron arg: {other}. usage: cargo run -- cron [once|watch] [-t <template>] [-v]"
+                        "unknown cron arg: {other}. usage: cargo run -- cron [once] [-t <template>] [-v]"
                     ));
                 }
             }
@@ -755,16 +874,41 @@ fn main() -> Result<()> {
 
     let mut args_iter = all_args.into_iter();
     let mut template_name: Option<String> = None;
+    let mut session_name: Option<String> = None;
+    let mut read_stdin = false;
     let mut prompt: Option<String> = None;
     while let Some(arg) = args_iter.next() {
         if arg == "-t" || arg == "--template" {
-            template_name = args_iter.next();
+            template_name = Some(
+                args_iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing template name after {arg}"))?,
+            );
+        } else if arg == "-s" || arg == "--session" {
+            session_name = Some(
+                args_iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing session id after {arg}"))?,
+            );
+        } else if arg == "-i" || arg == "--stdin" {
+            read_stdin = true;
         } else {
-            prompt = Some(arg);
+            prompt = Some(match prompt {
+                Some(existing) => format!("{existing} {arg}"),
+                None => arg,
+            });
         }
     }
-    let prompt =
-        prompt.ok_or_else(|| anyhow!("usage: cargo run -- [clean|cron <once|watch>|-t <template>] \"<prompt>\""))?;
+    if template_name.is_some() && session_name.is_some() {
+        return Err(anyhow!("-t/--template and -s/--session are mutually exclusive"));
+    }
+    if session_name.is_none() && template_name.is_none() && prompt.is_none() {
+        return Err(anyhow!(
+            "usage: cargo run -- [clean|cron [once]|-t <template> [prompt]|-s <session_id> [prompt]]"
+        ));
+    }
+    let is_resume_mode = session_name.is_some();
+    let init_only_new_session = !is_resume_mode && template_name.is_some() && prompt.is_none();
 
     // Resolve the workspace root (walks up from binary's real path if needed)
     // and cd there so .agent/, .tokens.yaml, .env, guest.wasm etc. all resolve
@@ -786,21 +930,165 @@ fn main() -> Result<()> {
     };
 
     // Load template allow-list if -t was supplied
-    let (shell_allow, shell_timeout, system_prompt, max_steps, validate_fn, max_validation_fails, enabled_tools, template_context_window, template_hooks, template_description, template_labels, template_model, ignore_ssl) = if let Some(ref name) = template_name {
+    let (shell_allow, shell_timeout, mut system_prompt, max_steps, validate_fn, max_validation_fails, mut enabled_tools, mut auto_approve_rules, template_context_window, template_hooks, mut template_description, mut template_labels, template_model, ignore_ssl) = if let Some(ref name) = template_name {
         let path = resolve_template(name, &extra_roots)?;
         println!("[HOST] Using template: {}", path.display());
         load_template(&path)?
     } else {
-        (Vec::new(), SHELL_TIMEOUT_DEFAULT, None, None, None, None, all_tool_names(), None, Vec::new(), None, Vec::new(), None, false)
+        (Vec::new(), SHELL_TIMEOUT_DEFAULT, None, None, None, None, all_tool_names(), Vec::new(), None, Vec::new(), None, Vec::new(), None, false)
     };
     let effective_hooks = merge_hooks(load_global_hooks()?, template_hooks);
     println!("[HOST] Hooks loaded: {}", effective_hooks.len());
 
+    let mut seed_history: Vec<HistoryEntry> = Vec::new();
+    let mut seed_validation_feedback: Vec<String> = Vec::new();
+    let mut seed_step: u32 = 0;
+    let mut seed_messages: Vec<SessionMessage> = Vec::new();
+    let mut seed_pending_calls: Vec<PendingToolCall> = Vec::new();
+    let mut seed_blocked_on_approval = false;
+    let mut resume_model: Option<String> = None;
+    let mut resume_prev_state: Option<String> = None;
+    let (session_id, session_created, prompt) = if let Some(session_id) = session_name.clone() {
+        let session_path = invocation_cwd
+            .join(".agent/sessions")
+            .join(format!("{session_id}.yaml"));
+        let snapshot = load_session_seed(&session_path)?;
+        let SessionSnapshotIn { metadata, spec } = snapshot;
+        seed_messages = normalize_session_messages(&spec.messages);
+        let (seed_prompt, parsed_history, parsed_feedback, parsed_step, parsed_pending_calls, blocked_on_approval) =
+            session_seed_from_messages(&spec.messages);
+        seed_history = parsed_history;
+        seed_validation_feedback = parsed_feedback;
+        seed_step = parsed_step;
+        seed_pending_calls = parsed_pending_calls;
+        seed_blocked_on_approval = blocked_on_approval;
+        if system_prompt.is_none() {
+            system_prompt = spec.system_prompt;
+        }
+        if !metadata.tools.is_empty() {
+            enabled_tools = metadata.tools.clone();
+        }
+        if template_description.is_none() {
+            template_description = metadata.description.clone();
+        }
+        if template_labels.is_empty() {
+            template_labels = metadata.labels.clone();
+        }
+        if template_name.is_none() && !metadata.name.is_empty() {
+            template_name = Some(metadata.name.clone());
+        }
+        if !metadata.model.is_empty() {
+            resume_model = Some(metadata.model.clone());
+        }
+        resume_prev_state = metadata
+            .status
+            .as_deref()
+            .map(normalize_stepwise_status)
+            .or_else(|| metadata.state.as_deref().map(normalize_stepwise_status));
+        let created = metadata.created.clone().unwrap_or_else(now_stamp);
+        let effective_prompt = if let Some(new_prompt) = prompt.clone() {
+            // A newly supplied resume prompt starts a fresh user turn.
+            // Do not keep the session parked behind prior pending approvals.
+            seed_blocked_on_approval = false;
+            seed_pending_calls.clear();
+            seed_messages.push(SessionMessage {
+                role: "user".to_string(),
+                verbatim: serde_json::json!({
+                    "content": new_prompt,
+                    "timestamp": now_stamp(),
+                }),
+                meta: serde_json::json!({
+                    "sent": false,
+                    "visible": true,
+                }),
+            });
+            new_prompt
+        } else {
+            seed_prompt
+        };
+        (metadata.id, created, effective_prompt)
+    } else {
+        // Generate canonical session ID: <timestampMs>-<pid>-<hex4>
+        let session_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let session_pid = std::process::id();
+        let session_rand = {
+            let mut h = Sha1::new();
+            h.update(session_ts.to_le_bytes());
+            h.update(session_pid.to_le_bytes());
+            let digest = h.finalize();
+            format!("{:02x}{:02x}", digest[0], digest[1])
+        };
+        let new_id = format!("{session_ts}-{session_pid}-{session_rand}");
+        (new_id, now_stamp(), prompt.unwrap_or_default())
+    };
+
+    if !is_resume_mode {
+        let stdin_text = if read_stdin { read_stdin_if_present()? } else { String::new() };
+        if let Some(raw_system_prompt) = system_prompt.clone() {
+            system_prompt = Some(render_system_prompt_template(
+                &raw_system_prompt,
+                &workspace_root,
+                &stdin_text,
+            )?);
+        }
+    }
+
+    if is_resume_mode && auto_approve_rules.is_empty() {
+        if let Some(ref name) = template_name {
+            if let Ok(path) = resolve_template(name, &extra_roots) {
+                if let Ok((_, _, _, _, _, _, _, rules, _, _, _, _, _, _)) = load_template(&path) {
+                    auto_approve_rules = rules;
+                }
+            }
+        }
+    }
+
     println!("[HOST] Starting agent with prompt: {:?}", prompt);
 
     let model = template_model
+        .or(resume_model)
         .or_else(|| env::var("XAI_MODEL").ok())
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+
+    if init_only_new_session {
+        let sessions_dir = invocation_cwd.join(".agent/sessions");
+        std::fs::create_dir_all(&sessions_dir).context("failed to create .agent/sessions/")?;
+        let snapshot = SessionSnapshot {
+            api_version: "daemon/v1".to_string(),
+            kind: "Agent".to_string(),
+            metadata: SessionMetadata {
+                id: session_id.clone(),
+                name: template_name.clone().unwrap_or_else(|| "solo".to_string()),
+                model: model.clone(),
+                status: "IDLE".to_string(),
+                created: session_created.clone(),
+                last_pid: std::process::id(),
+                tools: enabled_tools.clone(),
+                max_steps,
+                labels: template_labels.clone(),
+                description: template_description.clone(),
+                last_transition: Some(SessionTransition {
+                    action: "create".to_string(),
+                    from: "IDLE".to_string(),
+                    to: "IDLE".to_string(),
+                    timestamp: now_stamp(),
+                }),
+            },
+            spec: SessionSpec {
+                system_prompt: system_prompt.clone(),
+                messages: Vec::new(),
+            },
+        };
+        let yaml = serde_yaml::to_string(&snapshot).context("failed to serialize session snapshot")?;
+        let session_path = sessions_dir.join(format!("{}.yaml", session_id));
+        fs::write(&session_path, yaml).with_context(|| format!("failed to write {}", session_path.display()))?;
+        println!("{} IDLE .agent/sessions/{}.yaml", session_id, session_id);
+        return Ok(());
+    }
+
     let client = ClientBuilder::new()
         .danger_accept_invalid_certs(ignore_ssl)
         .build()
@@ -853,9 +1141,62 @@ fn main() -> Result<()> {
 
     linker.func_wrap(
         "host",
+        "get_session_seed",
+        |mut caller: Caller<'_, HostState>, out_ptr: i32, out_cap: i32| -> i32 {
+            let seed = SessionSeedPayload {
+                prompt: caller.data().prompt.clone(),
+                history: caller.data().seed_history.clone(),
+                validation_feedback: caller.data().seed_validation_feedback.clone(),
+                step: caller.data().seed_step,
+                pending_tool_calls: caller.data().seed_pending_calls.clone(),
+                blocked_on_approval: caller.data().seed_blocked_on_approval,
+            };
+            let raw = serde_json::to_string(&seed).unwrap_or_else(|_| "{}".to_string());
+            write_memory(&mut caller, out_ptr, out_cap, &raw)
+        },
+    )?;
+
+    linker.func_wrap(
+        "host",
+        "save_session_checkpoint",
+        |mut caller: Caller<'_, HostState>, req_ptr: i32, req_len: i32, state_ptr: i32, state_len: i32, action_ptr: i32, action_len: i32| -> i32 {
+            let req_json = match read_memory(&mut caller, req_ptr, req_len) {
+                Ok(v) => v,
+                Err(_) => return -1,
+            };
+            let req: GuestRequest = match serde_json::from_str(&req_json) {
+                Ok(v) => v,
+                Err(_) => return -2,
+            };
+            let session_state = match read_memory(&mut caller, state_ptr, state_len) {
+                Ok(v) if !v.trim().is_empty() => v,
+                _ => "IDLE".to_string(),
+            };
+            let action = match read_memory(&mut caller, action_ptr, action_len) {
+                Ok(v) if !v.trim().is_empty() => v,
+                _ => "checkpoint".to_string(),
+            };
+            if action == "tool_call_pending" {
+                // grok_chat already persisted the assistant tool-call batch for this turn.
+                // Avoid clobbering it with a req-only snapshot.
+                return 0;
+            }
+            if write_session_snapshot(caller.data_mut(), &session_state, &action, Some(&req), None).is_err() {
+                return -3;
+            }
+            0
+        },
+    )?;
+
+    linker.func_wrap(
+        "host",
         "get_max_steps",
         |caller: Caller<'_, HostState>| -> i32 {
-            caller.data().max_steps.map(|n| n as i32).unwrap_or(-1)
+            let one_turn_cap = caller.data().seed_step.saturating_add(1) as i32;
+            match caller.data().max_steps {
+                Some(template_cap) => one_turn_cap.min(template_cap as i32),
+                None => one_turn_cap,
+            }
         },
     )?;
 
@@ -1043,6 +1384,7 @@ fn main() -> Result<()> {
                 Err(e) => {
                     let fallback = serde_json::to_string(&LlmDecision::Error {
                         message: format!("invalid request memory: {e}"),
+                        perf: None,
                     })
                     .unwrap_or_else(|_| {
                         "{\"type\":\"error\",\"message\":\"internal\"}".to_string()
@@ -1056,6 +1398,7 @@ fn main() -> Result<()> {
                 Err(e) => {
                     let fallback = serde_json::to_string(&LlmDecision::Error {
                         message: format!("bad guest request JSON: {e}"),
+                        perf: None,
                     })
                     .unwrap_or_else(|_| {
                         "{\"type\":\"error\",\"message\":\"internal\"}".to_string()
@@ -1069,17 +1412,18 @@ fn main() -> Result<()> {
                 Ok(v) => v,
                 Err(err) => LlmDecision::Error {
                     message: format!("llm call failed: {err:#}"),
+                    perf: None,
                 },
             };
 
-            if let LlmDecision::ToolCall { tool, tool_call_id, .. } = &decision {
-                println!("[LLM → GUEST] Tool call: {tool} (id={tool_call_id})");
+            if let LlmDecision::ToolCall { tool_calls, .. } = &decision {
+                println!("[LLM → GUEST] Tool calls: {}", tool_calls.len());
             }
 
             let (status, action) = match &decision {
-                LlmDecision::Final { .. } => ("success", "complete"),
-                LlmDecision::Error { .. } => ("error", "fail"),
-                LlmDecision::ToolCall { .. } => ("running", "tick"),
+                LlmDecision::Final { .. } => ("SUCCESS", "complete"),
+                LlmDecision::Error { .. } => ("FAIL", "fail"),
+                LlmDecision::ToolCall { .. } => ("IDLE", "tool_call"),
             };
             if let Err(e) = write_session_snapshot(caller.data_mut(), status, action, Some(&req), Some(&decision)) {
                 eprintln!("[HOST] session snapshot write failed: {e:#}");
@@ -1726,22 +2070,7 @@ fn main() -> Result<()> {
         },
     )?;
 
-    // Generate canonical session ID: <timestampMs>-<pid>-<hex4>
-    let session_ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let session_pid = std::process::id();
-    let session_rand = {
-        let mut h = Sha1::new();
-        h.update(session_ts.to_le_bytes());
-        h.update(session_pid.to_le_bytes());
-        let digest = h.finalize();
-        format!("{:02x}{:02x}", digest[0], digest[1])
-    };
-    let session_id = format!("{session_ts}-{session_pid}-{session_rand}");
     println!("[HOST] Session: {session_id}");
-    let session_created = now_stamp();
 
     // .agent/fs is local to the invocation cwd (each working directory gets its own vfs)
     let tcow_dir = invocation_cwd.join(".agent/fs");
@@ -1775,20 +2104,29 @@ fn main() -> Result<()> {
         validate_fn,
         max_validation_fails,
         enabled_tools,
+        auto_approve_rules,
         context_window,
         session_id,
         workspace_root,
         invocation_cwd,
         hooks: effective_hooks,
         session_created,
-        session_status: "pending".to_string(),
+        session_state: resume_prev_state.unwrap_or_else(|| "RUNNING".to_string()),
         template_name: template_name.clone().unwrap_or_else(|| "solo".to_string()),
         template_description,
         template_labels,
+        seed_history,
+        seed_validation_feedback,
+        seed_step,
+        seed_messages,
+        seed_pending_calls,
+        seed_blocked_on_approval,
     };
 
     let mut store = Store::new(&engine, state);
-    write_session_snapshot(store.data_mut(), "pending", "create", None, None)?;
+    if !is_resume_mode {
+        write_session_snapshot(store.data_mut(), "RUNNING", "create", None, None)?;
+    }
     store
         .add_fuel(FUEL_LIMIT)
         .context("failed to set fuel limit")?;
@@ -1804,7 +2142,9 @@ fn main() -> Result<()> {
         if let Some(reason) = run_hooks(store.data_mut(), "before_agent_start", &payload, true)? {
             return Err(anyhow!("blocked by hook before_agent_start: {reason}"));
         }
-        write_session_snapshot(store.data_mut(), "running", "start", None, None)?;
+        if !is_resume_mode {
+            write_session_snapshot(store.data_mut(), "RUNNING", "start", None, None)?;
+        }
         let _ = run_hooks(
             store.data_mut(),
             "session_start",
@@ -1844,10 +2184,11 @@ fn main() -> Result<()> {
     }
 
     let had_final = store.data().final_answer.is_some();
-    if !had_final {
+    let needs_stop_fallback = !had_final && normalize_stepwise_status(&store.data().session_state) == "RUNNING";
+    if needs_stop_fallback {
         write_session_snapshot(
             store.data_mut(),
-            "stopped",
+            "IDLE",
             "stop",
             None,
             None,
@@ -1861,6 +2202,9 @@ fn main() -> Result<()> {
         }),
         false,
     )?;
+
+    let summary_path = format!(".agent/sessions/{}.yaml", store.data().session_id);
+    println!("{} {} {}", store.data().session_id, store.data().session_state, summary_path);
 
     Ok(())
 }
@@ -1893,24 +2237,123 @@ fn resolve_workspace_root() -> Result<PathBuf> {
         }
     }
 
-    // 2. Derive from binary location: {workspace}/target/{profile}/wasm1
-    //    Canonicalize first to resolve any symlink (e.g. ~/.cargo/bin/wasm1).
+    // 2. Derive from binary location by walking upward from the resolved
+    //    executable path (after following symlinks).
     if let Ok(exe) = env::current_exe() {
         let exe_resolved = fs::canonicalize(&exe).unwrap_or(exe);
-        // exe_resolved = .../workspace/target/release/wasm1
-        //   .parent()  = .../workspace/target/release
-        //   .parent()  = .../workspace/target
-        //   .parent()  = .../workspace
-        if let Some(workspace) = exe_resolved.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
-            if looks_like_workspace_root(workspace) {
-                return Ok(workspace.to_path_buf());
+        let mut cur = exe_resolved.parent().map(Path::to_path_buf);
+        while let Some(dir) = cur {
+            if looks_like_workspace_root(&dir) {
+                return Ok(dir);
             }
+            cur = dir.parent().map(Path::to_path_buf);
         }
     }
 
-    // 3. cwd fallback (e.g. `cargo run` where the binary lives inside the workspace)
+    // 3. Final fallback: use invocation cwd.
     let cwd = env::current_dir().context("failed to get current directory")?;
     Ok(cwd)
+}
+
+fn os_release_string() -> String {
+    if let Ok(text) = fs::read_to_string("/proc/sys/kernel/osrelease") {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(out) = Command::new("uname").arg("-r").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+fn read_stdin_if_present() -> Result<String> {
+    let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+    if is_tty {
+        return Ok(String::new());
+    }
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .context("failed reading stdin for -i")?;
+    Ok(buf)
+}
+
+fn resolve_workspace_relative_file(workspace_root: &Path, rel: &str) -> Result<PathBuf> {
+    let candidate = workspace_root.join(rel);
+    let canonical_candidate = fs::canonicalize(&candidate)
+        .with_context(|| format!("includePrompt path not found: {rel}"))?;
+    let canonical_root = fs::canonicalize(workspace_root)
+        .with_context(|| format!("failed to resolve workspace root: {}", workspace_root.display()))?;
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return Err(anyhow!("includePrompt path escapes workspace root: {rel}"));
+    }
+    Ok(canonical_candidate)
+}
+
+fn render_system_prompt_template(raw: &str, workspace_root: &Path, stdin_text: &str) -> Result<String> {
+    let mut env = MiniJinjaEnv::new();
+    let stdin_owned = stdin_text.to_string();
+    env.add_function("readStdin", move || -> String { stdin_owned.clone() });
+
+    let include_root = workspace_root.to_path_buf();
+    env.add_function("includePrompt", move |rel_path: String| -> Result<String, minijinja::Error> {
+        if Path::new(&rel_path).is_absolute() {
+            return Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                "includePrompt expects a workspace-relative path",
+            ));
+        }
+        let path = resolve_workspace_relative_file(&include_root, &rel_path).map_err(|e| {
+            minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
+        })?;
+        fs::read_to_string(&path)
+            .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))
+    });
+
+    env.add_function("shell", move |cmd: String| -> Result<String, minijinja::Error> {
+        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let out = Command::new(shell)
+            .arg("-lc")
+            .arg(&cmd)
+            .output()
+            .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                format!("shell helper command failed: {stderr}"),
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    });
+
+    let process_shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let ctx = mj_context! {
+        process => serde_json::json!({
+            "cwd": workspace_root.display().to_string(),
+            "env": env::vars().collect::<HashMap<String, String>>(),
+            "platform": env::consts::OS,
+            "shell": process_shell,
+        }),
+        os => serde_json::json!({
+            "release": os_release_string(),
+        }),
+    };
+
+    env.add_template("system_prompt", raw)
+        .map_err(|e| anyhow!("invalid system_prompt template: {e}"))?;
+    let tmpl = env
+        .get_template("system_prompt")
+        .map_err(|e| anyhow!("failed loading system_prompt template: {e}"))?;
+    tmpl.render(ctx)
+        .map_err(|e| anyhow!("failed rendering system_prompt template: {e}"))
 }
 
 fn load_or_init_cron_interval_ms(workspace_root: &Path) -> Result<u64> {
@@ -2039,33 +2482,7 @@ fn run_cron(mode: &str, template_name: Option<&str>, verbose: bool) -> Result<()
             }
             Ok(())
         }
-        "watch" => {
-            loop {
-                let stats = run_cron_tick(
-                    &hooks,
-                    &workspace_root,
-                    &session_id,
-                    template_name,
-                    "watch",
-                    true,
-                    verbose,
-                )?;
-                if verbose {
-                    println!(
-                        "{} {} ran={}, skipped={}, success={}, failed={}, total={}ms",
-                        c24("[cron]", 120, 180, 255),
-                        c24("iteration summary:", 200, 210, 220),
-                        c24(&stats.hooks_ran.to_string(), 160, 200, 255),
-                        c24(&stats.hooks_skipped.to_string(), 160, 200, 255),
-                        c24(&stats.hooks_success.to_string(), 110, 220, 140),
-                        c24(&stats.hooks_failed.to_string(), 255, 120, 120),
-                        c24(&stats.elapsed_ms.to_string(), 180, 180, 255),
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(cron_interval_ms));
-            }
-        }
-        _ => Err(anyhow!("usage: wasm1 cron [once|watch] [-t <template>] [-v]")),
+        _ => Err(anyhow!("usage: wasm1 cron [once] [-t <template>] [-v]")),
     }
 }
 
@@ -2774,52 +3191,481 @@ fn parse_assistant_message(assistant_msg_json: &str) -> serde_json::Value {
     value
 }
 
-fn build_session_messages(req: Option<&GuestRequest>, decision: Option<&LlmDecision>) -> Vec<serde_json::Value> {
-    let mut messages = Vec::new();
-    if let Some(req) = req {
-        messages.push(serde_json::json!({
-            "role": "user",
-            "content": req.prompt,
-            "timestamp": now_stamp(),
-        }));
+fn normalize_stepwise_status(raw: &str) -> String {
+    match raw.trim().to_ascii_uppercase().as_str() {
+        "RUNNING" => "RUNNING".to_string(),
+        "SUCCESS" => "SUCCESS".to_string(),
+        "IDLE" => "IDLE".to_string(),
+        "FAIL" => "FAIL".to_string(),
+        _ => "RUNNING".to_string(),
+    }
+}
 
+fn message_verbatim(msg: &serde_json::Value) -> serde_json::Value {
+    msg.get("verbatim")
+        .cloned()
+        .unwrap_or_else(|| msg.clone())
+}
+
+fn normalize_session_messages(messages: &[serde_json::Value]) -> Vec<SessionMessage> {
+    messages
+        .iter()
+        .map(|msg| {
+            let role = msg
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("assistant")
+                .to_string();
+            let verbatim = message_verbatim(msg);
+            let meta = msg
+                .get("meta")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"visible": true, "sent": true}));
+            SessionMessage { role, verbatim, meta }
+        })
+        .collect()
+}
+
+fn message_text_content(msg: &serde_json::Value) -> String {
+    let verbatim = message_verbatim(msg);
+    verbatim["content"].as_str().unwrap_or("").to_string()
+}
+
+fn message_visible(msg: &serde_json::Value) -> bool {
+    msg.get("meta")
+        .and_then(|m| m.get("visible"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+fn message_sent(msg: &serde_json::Value) -> bool {
+    msg.get("meta")
+        .and_then(|m| m.get("sent"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+fn assistant_call_sent(msg: &serde_json::Value, call_id: &str) -> bool {
+    msg.get("meta")
+        .and_then(|m| m.get("calls"))
+        .and_then(|c| c.get(call_id))
+        .and_then(|c| c.get("sent"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+fn assistant_call_status(msg: &serde_json::Value, call_id: &str) -> String {
+    msg.get("meta")
+        .and_then(|m| m.get("calls"))
+        .and_then(|c| c.get(call_id))
+        .and_then(|c| c.get("approval"))
+        .and_then(|a| a.get("status"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("approved")
+        .to_string()
+}
+
+fn assistant_call_modified_args(msg: &serde_json::Value, call_id: &str) -> Option<serde_json::Value> {
+    msg.get("meta")
+        .and_then(|m| m.get("calls"))
+        .and_then(|c| c.get(call_id))
+        .and_then(|c| c.get("approval"))
+        .and_then(|a| a.get("modified_args"))
+        .cloned()
+        .filter(|v| !v.is_null())
+}
+
+fn tool_result_status(msg: &serde_json::Value) -> String {
+    msg.get("meta")
+        .and_then(|m| m.get("approval"))
+        .and_then(|a| a.get("status"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("approved")
+        .to_string()
+}
+
+fn tool_result_modified_content(msg: &serde_json::Value) -> Option<String> {
+    msg.get("meta")
+        .and_then(|m| m.get("approval"))
+        .and_then(|a| a.get("modified_content"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn session_seed_from_messages(messages: &[serde_json::Value]) -> (String, Vec<HistoryEntry>, Vec<String>, u32, Vec<PendingToolCall>, bool) {
+    let mut prompt = String::new();
+    let mut history: Vec<HistoryEntry> = Vec::new();
+    let mut validation_feedback: Vec<String> = Vec::new();
+    let mut pending_assistant: HashMap<String, (String, String)> = HashMap::new();
+    let mut approved_calls: HashMap<String, PendingToolCall> = HashMap::new();
+    let mut seen_tool_results: HashSet<String> = HashSet::new();
+    let mut pending_human_approvals = false;
+
+    for msg in messages {
+        let role = msg["role"].as_str().unwrap_or("");
+        match role {
+            "user" => {
+                if !message_visible(msg) {
+                    continue;
+                }
+                let content = message_text_content(msg);
+                if content.is_empty() {
+                    continue;
+                }
+                if prompt.is_empty() {
+                    prompt = content;
+                } else {
+                    validation_feedback.push(content);
+                }
+            }
+            "assistant" => {
+                if !message_visible(msg) {
+                    continue;
+                }
+                let mut payload = message_verbatim(msg);
+                if payload.get("role").is_none() {
+                    payload["role"] = serde_json::Value::String("assistant".to_string());
+                }
+                if let Some(calls) = payload["tool_calls"].as_array() {
+                    let assistant_msg_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+                    for tc in calls {
+                        let tool_call_id = tc["id"].as_str().unwrap_or("").to_string();
+                        if tool_call_id.is_empty() {
+                            continue;
+                        }
+                        let tool_name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                        let status = assistant_call_status(msg, &tool_call_id);
+                        if status == "rejected" {
+                            validation_feedback.push(format!(
+                                "policy rejection: user rejected tool call id={} name={} before execution.",
+                                tool_call_id, tool_name
+                            ));
+                            continue;
+                        }
+                        if status == "pending" {
+                            pending_human_approvals = true;
+                        }
+                        if !assistant_call_sent(msg, &tool_call_id) {
+                            continue;
+                        }
+
+                        pending_assistant.insert(tool_call_id.clone(), (tool_name.clone(), assistant_msg_json.clone()));
+
+                        let base_args = tc["function"]["arguments"]
+                            .as_str()
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        let args = if status == "modified" {
+                            assistant_call_modified_args(msg, &tool_call_id).unwrap_or(base_args)
+                        } else {
+                            base_args
+                        };
+                        approved_calls.insert(
+                            tool_call_id.clone(),
+                            PendingToolCall {
+                                tool: tool_name,
+                                tool_call_id,
+                                args,
+                                assistant_msg_json: assistant_msg_json.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+            "tool" => {
+                let payload = message_verbatim(msg);
+                let maybe_id = payload["tool_call_id"].as_str().map(str::to_string).unwrap_or_default();
+                let status = tool_result_status(msg);
+                if status == "rejected" {
+                    if !maybe_id.is_empty() {
+                        seen_tool_results.insert(maybe_id.clone());
+                    }
+                    validation_feedback.push(
+                        "policy error: the tool was executed successfully, but the user censored the response from this tool because it may have contained sensitive information.".to_string()
+                    );
+                    continue;
+                }
+
+                if !message_visible(msg) || !message_sent(msg) {
+                    if status == "pending" {
+                        pending_human_approvals = true;
+                    }
+                    if let Some(id) = payload["tool_call_id"].as_str() {
+                        if !id.is_empty() {
+                            seen_tool_results.insert(id.to_string());
+                        }
+                    }
+                    continue;
+                }
+                let tool_call_id = payload["tool_call_id"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                if tool_call_id.is_empty() {
+                    continue;
+                }
+                seen_tool_results.insert(tool_call_id.clone());
+                let (fallback_name, fallback_assistant_json) = pending_assistant
+                    .remove(&tool_call_id)
+                    .unwrap_or_else(|| (String::new(), "{\"role\":\"assistant\",\"content\":\"\"}".to_string()));
+                let tool_name = payload["name"].as_str().unwrap_or(&fallback_name).to_string();
+                let assistant_msg_json = fallback_assistant_json;
+
+                let result_json = if status == "modified" {
+                    tool_result_modified_content(msg)
+                        .map(|content| serde_json::json!({"result": content}).to_string())
+                        .unwrap_or_else(|| payload["result_json"].as_str().map(str::to_string).unwrap_or_else(|| {
+                            let content = payload["content"].as_str().unwrap_or("");
+                            serde_json::json!({"result": content}).to_string()
+                        }))
+                } else {
+                    payload["result_json"].as_str().map(str::to_string).unwrap_or_else(|| {
+                        let content = payload["content"].as_str().unwrap_or("");
+                        serde_json::json!({"result": content}).to_string()
+                    })
+                };
+
+                history.push(HistoryEntry {
+                    tool_call_id,
+                    tool_name,
+                    assistant_msg_json,
+                    result_json,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let step = history.len() as u32;
+    let pending_tool_calls = approved_calls
+        .into_iter()
+        .filter_map(|(id, call)| {
+            if seen_tool_results.contains(&id) {
+                None
+            } else {
+                Some(call)
+            }
+        })
+        .collect::<Vec<_>>();
+    let blocked_on_approval = pending_human_approvals && pending_tool_calls.is_empty();
+    if prompt.is_empty() {
+        for msg in messages.iter().rev() {
+            if msg["role"].as_str().unwrap_or("") != "user" {
+                continue;
+            }
+            if !message_visible(msg) {
+                continue;
+            }
+            let content = message_text_content(msg);
+            if !content.is_empty() {
+                prompt = content;
+                break;
+            }
+        }
+    }
+    (prompt, history, validation_feedback, step, pending_tool_calls, blocked_on_approval)
+}
+
+fn load_session_seed(path: &Path) -> Result<SessionSnapshotIn> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read session file: {}", path.display()))?;
+    let snapshot: SessionSnapshotIn = serde_yaml::from_str(&raw)
+        .with_context(|| format!("failed to parse session YAML: {}", path.display()))?;
+    Ok(snapshot)
+}
+
+fn build_session_messages(req: Option<&GuestRequest>, decision: Option<&LlmDecision>, auto_rules: &[AutoApproveRule]) -> Vec<SessionMessage> {
+    let mut messages: Vec<SessionMessage> = Vec::new();
+    let mut unsent_tool_result_ids: HashSet<String> = HashSet::new();
+    if let Some(req) = req {
+        for id in &req.unsent_tool_result_ids {
+            unsent_tool_result_ids.insert(id.clone());
+        }
+    }
+    if let Some(req) = req {
+        if !req.prompt.is_empty() {
+            messages.push(SessionMessage {
+                role: "user".to_string(),
+                verbatim: serde_json::json!({
+                    "content": req.prompt,
+                    "timestamp": now_stamp(),
+                }),
+                meta: serde_json::json!({
+                    "visible": true,
+                    "sent": true,
+                }),
+            });
+        }
+
+        let mut emitted_assistant_batches: HashSet<String> = HashSet::new();
         for entry in &req.history {
-            messages.push(parse_assistant_message(&entry.assistant_msg_json));
-            messages.push(serde_json::json!({
-                "role": "tool",
-                "tool_call_id": entry.tool_call_id,
-                "name": entry.tool_name,
-                "content": format_tool_result(&entry.result_json),
-                "timestamp": now_stamp(),
-            }));
+            if !emitted_assistant_batches.contains(&entry.assistant_msg_json) {
+                emitted_assistant_batches.insert(entry.assistant_msg_json.clone());
+                let assistant_payload = parse_assistant_message(&entry.assistant_msg_json);
+                let executed_call_ids: HashSet<String> = req
+                    .history
+                    .iter()
+                    .filter(|h| h.assistant_msg_json == entry.assistant_msg_json)
+                    .map(|h| h.tool_call_id.clone())
+                    .collect();
+                let mut calls_meta = serde_json::Map::new();
+                if let Some(calls) = assistant_payload["tool_calls"].as_array() {
+                    for tc in calls {
+                        let id = tc["id"].as_str().unwrap_or("");
+                        if id.is_empty() {
+                            continue;
+                        }
+                        let executed = executed_call_ids.contains(id);
+                        calls_meta.insert(
+                            id.to_string(),
+                            serde_json::json!({
+                                "sent": executed,
+                                "approval": {
+                                    "status": if executed { "approved" } else { "pending" },
+                                    "reviewed_at": null,
+                                    "reason": null,
+                                    "modified_args": null,
+                                }
+                            }),
+                        );
+                    }
+                }
+                messages.push(SessionMessage {
+                    role: "assistant".to_string(),
+                    verbatim: assistant_payload,
+                    meta: serde_json::json!({
+                        "kind": "tool_call_batch",
+                        "visible": true,
+                        "calls": calls_meta,
+                    }),
+                });
+            }
+            messages.push(SessionMessage {
+                role: "tool".to_string(),
+                verbatim: serde_json::json!({
+                    "tool_call_id": entry.tool_call_id,
+                    "name": entry.tool_name,
+                    "content": format_tool_result(&entry.result_json),
+                    "result_json": entry.result_json,
+                    "timestamp": now_stamp(),
+                }),
+                meta: {
+                    let force_pending = unsent_tool_result_ids.contains(&entry.tool_call_id);
+                    let auto_result = should_auto_approve_result(auto_rules, &entry.tool_name);
+                    let sent = if force_pending { auto_result } else { true };
+                    let status = if force_pending {
+                        if auto_result { "approved" } else { "pending" }
+                    } else {
+                        "approved"
+                    };
+                    serde_json::json!({
+                    "kind": "tool_result",
+                    "visible": true,
+                    "sent": sent,
+                    "approval": {
+                        "status": status,
+                        "reviewed_at": null,
+                        "reason": null,
+                        "modified_content": null,
+                    }
+                    })
+                },
+            });
+        }
+
+        for feedback in &req.validation_feedback {
+            if feedback.is_empty() {
+                continue;
+            }
+            messages.push(SessionMessage {
+                role: "user".to_string(),
+                verbatim: serde_json::json!({
+                    "content": feedback,
+                    "timestamp": now_stamp(),
+                }),
+                meta: serde_json::json!({
+                    "visible": true,
+                    "sent": true,
+                }),
+            });
         }
     }
 
     if let Some(decision) = decision {
         match decision {
             LlmDecision::ToolCall {
+                tool_calls,
                 assistant_msg_json,
-                ..
+                perf,
             } => {
-                messages.push(parse_assistant_message(assistant_msg_json));
+                let assistant_payload = parse_assistant_message(assistant_msg_json);
+                let mut calls_meta = serde_json::Map::new();
+                for call in tool_calls {
+                    let approved = should_auto_approve_call(auto_rules, call);
+                    calls_meta.insert(
+                        call.tool_call_id.clone(),
+                        serde_json::json!({
+                            "sent": approved,
+                            "approval": {
+                                "status": if approved { "approved" } else { "pending" },
+                                "reviewed_at": null,
+                                "reason": null,
+                                "modified_args": null,
+                            }
+                        }),
+                    );
+                }
+                let mut assistant_meta = serde_json::json!({
+                    "kind": "tool_call_batch",
+                    "visible": true,
+                    "calls": calls_meta,
+                });
+                if let Some(perf_val) = perf {
+                    assistant_meta["perf"] = perf_val.clone();
+                }
+                messages.push(SessionMessage {
+                    role: "assistant".to_string(),
+                    verbatim: assistant_payload,
+                    meta: assistant_meta,
+                });
             }
-            LlmDecision::Final { answer, .. } => {
-                messages.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": answer,
-                    "tool_calls": [],
-                    "finish_reason": "stop",
-                    "timestamp": now_stamp(),
-                }));
+            LlmDecision::Final { answer, perf, .. } => {
+                let mut assistant_meta = serde_json::json!({
+                    "visible": true,
+                    "sent": true,
+                });
+                if let Some(perf_val) = perf {
+                    assistant_meta["perf"] = perf_val.clone();
+                }
+                messages.push(SessionMessage {
+                    role: "assistant".to_string(),
+                    verbatim: serde_json::json!({
+                        "content": answer,
+                        "tool_calls": [],
+                        "finish_reason": "stop",
+                        "timestamp": now_stamp(),
+                    }),
+                    meta: assistant_meta,
+                });
             }
-            LlmDecision::Error { message } => {
-                messages.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": format!("ERROR: {message}"),
-                    "tool_calls": [],
-                    "finish_reason": "error",
-                    "timestamp": now_stamp(),
-                }));
+            LlmDecision::Error { message, perf } => {
+                let mut assistant_meta = serde_json::json!({
+                    "visible": true,
+                    "sent": true,
+                });
+                if let Some(perf_val) = perf {
+                    assistant_meta["perf"] = perf_val.clone();
+                }
+                messages.push(SessionMessage {
+                    role: "assistant".to_string(),
+                    verbatim: serde_json::json!({
+                        "content": format!("ERROR: {message}"),
+                        "tool_calls": [],
+                        "finish_reason": "error",
+                        "timestamp": now_stamp(),
+                    }),
+                    meta: assistant_meta,
+                });
             }
         }
     }
@@ -2829,12 +3675,56 @@ fn build_session_messages(req: Option<&GuestRequest>, decision: Option<&LlmDecis
 
 fn write_session_snapshot(
     state: &mut HostState,
-    status: &str,
+    session_state: &str,
     action: &str,
     req: Option<&GuestRequest>,
     decision: Option<&LlmDecision>,
 ) -> Result<()> {
-    let from = state.session_status.clone();
+    let from = state.session_state.clone();
+    let messages = if !state.seed_messages.is_empty() {
+        let mut merged = state.seed_messages.clone();
+        if req.is_some() {
+            for msg in &mut merged {
+                if msg.role != "user" {
+                    continue;
+                }
+                let content = msg
+                    .verbatim
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if content.is_empty() {
+                    continue;
+                }
+                let visible = msg
+                    .meta
+                    .get("visible")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let sent = msg
+                    .meta
+                    .get("sent")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                if visible && !sent {
+                    if let Some(meta_obj) = msg.meta.as_object_mut() {
+                        meta_obj.insert("sent".to_string(), serde_json::json!(true));
+                    } else {
+                        msg.meta = serde_json::json!({"visible": true, "sent": true});
+                    }
+                }
+            }
+        }
+        if let Some(dec) = decision {
+            merged.extend(build_session_messages(None, Some(dec), &state.auto_approve_rules));
+        }
+        state.seed_messages = merged.clone();
+        merged
+    } else {
+        let built = build_session_messages(req, decision, &state.auto_approve_rules);
+        state.seed_messages = built.clone();
+        built
+    };
     let snapshot = SessionSnapshot {
         api_version: "daemon/v1".to_string(),
         kind: "Agent".to_string(),
@@ -2842,7 +3732,7 @@ fn write_session_snapshot(
             id: state.session_id.clone(),
             name: state.template_name.clone(),
             model: state.model.clone(),
-            status: status.to_string(),
+            status: session_state.to_string(),
             created: state.session_created.clone(),
             last_pid: std::process::id(),
             tools: state.enabled_tools.clone(),
@@ -2852,18 +3742,18 @@ fn write_session_snapshot(
             last_transition: Some(SessionTransition {
                 action: action.to_string(),
                 from,
-                to: status.to_string(),
+                to: session_state.to_string(),
                 timestamp: now_stamp(),
             }),
         },
         spec: SessionSpec {
             system_prompt: state.system_prompt.clone(),
-            messages: build_session_messages(req, decision),
+            messages,
         },
     };
     let yaml = serde_yaml::to_string(&snapshot).context("failed to serialize session snapshot")?;
     fs::write(session_snapshot_path(state), yaml).context("failed to write session snapshot")?;
-    state.session_status = status.to_string();
+    state.session_state = session_state.to_string();
     Ok(())
 }
 
@@ -3541,6 +4431,96 @@ fn format_tool_result(result_json: &str) -> String {
     }
 }
 
+fn auto_approve_match_text(call: &ToolInvocation) -> String {
+    if call.tool == "shell__execute" {
+        return call.args["command"].as_str().unwrap_or("").to_string();
+    }
+    if call.tool == "js_exec" {
+        return call.args["code"].as_str().unwrap_or("").to_string();
+    }
+    call.args.to_string()
+}
+
+fn build_llm_messages_from_seed(state: &HostState) -> Vec<serde_json::Value> {
+    let mut messages: Vec<serde_json::Value> = vec![serde_json::json!({
+        "role": "system",
+        "content": state.system_prompt.as_deref().unwrap_or(""),
+    })];
+
+    for msg in &state.seed_messages {
+        let visible = msg
+            .meta
+            .get("visible")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if !visible {
+            continue;
+        }
+        match msg.role.as_str() {
+            "user" => {
+                let content = msg
+                    .verbatim
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !content.is_empty() {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": content,
+                    }));
+                }
+            }
+            "assistant" => {
+                let mut assistant = msg.verbatim.clone();
+                if assistant.get("role").is_none() {
+                    assistant["role"] = serde_json::json!("assistant");
+                }
+                messages.push(assistant);
+            }
+            "tool" => {
+                let content = msg
+                    .verbatim
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let mut tool_msg = serde_json::json!({
+                    "role": "tool",
+                    "content": content,
+                });
+                if let Some(id) = msg.verbatim.get("tool_call_id").and_then(|v| v.as_str()) {
+                    tool_msg["tool_call_id"] = serde_json::json!(id);
+                }
+                if let Some(name) = msg.verbatim.get("name").and_then(|v| v.as_str()) {
+                    tool_msg["name"] = serde_json::json!(name);
+                }
+                messages.push(tool_msg);
+            }
+            _ => {}
+        }
+    }
+
+    messages
+}
+
+fn should_auto_approve_call(rules: &[AutoApproveRule], call: &ToolInvocation) -> bool {
+    let text = auto_approve_match_text(call);
+    rules.iter().any(|r| {
+        if r.tool != call.tool {
+            return false;
+        }
+        match &r.pattern {
+            Some(pat) => pat.is_match(&text),
+            None => true,
+        }
+    })
+}
+
+fn should_auto_approve_result(rules: &[AutoApproveRule], tool_name: &str) -> bool {
+    rules.iter().any(|r| r.tool == tool_name)
+}
+
 /// Normalize model name for GitHub Copilot internal API.
 /// The internal API (api.githubcopilot.com) accepts model names directly
 /// without publisher prefixes (e.g., "gpt-4o", "claude-sonnet-4").
@@ -3560,40 +4540,69 @@ fn usage_thought_tokens(usage: &serde_json::Value) -> u64 {
         .unwrap_or(0)
 }
 
+fn assistant_content_text(message: &serde_json::Value) -> String {
+    if let Some(s) = message["content"].as_str() {
+        return s.trim().to_string();
+    }
+    if let Some(parts) = message["content"].as_array() {
+        let mut out = String::new();
+        for part in parts {
+            if let Some(s) = part["text"].as_str() {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(s);
+                continue;
+            }
+            if let Some(s) = part["content"].as_str() {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(s);
+            }
+        }
+        return out.trim().to_string();
+    }
+    String::new()
+}
+
 fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
     // Build provider-compatible tool definitions
     let tools_json_str = build_tools_json(&state.enabled_tools);
     let tools_value: serde_json::Value = serde_json::from_str(&tools_json_str)
         .unwrap_or(serde_json::json!([]));
 
-    let system = state.system_prompt.as_deref().unwrap_or("");
-    let initial_user = &req.prompt;
-
-    // Build messages: system → user(prompt) → [assistant{tool_calls} → tool{result}]...
-    let mut messages: Vec<serde_json::Value> = vec![
-        serde_json::json!({"role": "system", "content": system}),
-        serde_json::json!({"role": "user", "content": initial_user}),
-    ];
-    for entry in &req.history {
-        // Re-insert assistant message exactly as the API returned it (contains tool_calls)
-        let assistant: serde_json::Value = serde_json::from_str(&entry.assistant_msg_json)
-            .unwrap_or_else(|_| serde_json::json!({"role": "assistant", "content": ""}));
-        messages.push(assistant);
-        // Tool result as role:tool
-        let summary = format_tool_result(&entry.result_json);
-        messages.push(serde_json::json!({
-            "role": "tool",
-            "tool_call_id": entry.tool_call_id,
-            "name": entry.tool_name,
-            "content": summary,
-        }));
-    }
-    for feedback in &req.validation_feedback {
-        messages.push(serde_json::json!({
-            "role": "user",
-            "content": feedback,
-        }));
-    }
+    // For resumed sessions, preserve exact YAML ordering and role alternation.
+    // For brand-new sessions, keep legacy seed behavior.
+    let messages: Vec<serde_json::Value> = if !state.seed_messages.is_empty() {
+        build_llm_messages_from_seed(state)
+    } else {
+        let system = state.system_prompt.as_deref().unwrap_or("");
+        let initial_user = &req.prompt;
+        let mut m: Vec<serde_json::Value> = vec![
+            serde_json::json!({"role": "system", "content": system}),
+            serde_json::json!({"role": "user", "content": initial_user}),
+        ];
+        for entry in &req.history {
+            let assistant: serde_json::Value = serde_json::from_str(&entry.assistant_msg_json)
+                .unwrap_or_else(|_| serde_json::json!({"role": "assistant", "content": ""}));
+            m.push(assistant);
+            let summary = format_tool_result(&entry.result_json);
+            m.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": entry.tool_call_id,
+                "name": entry.tool_name,
+                "content": summary,
+            }));
+        }
+        for feedback in &req.validation_feedback {
+            m.push(serde_json::json!({
+                "role": "user",
+                "content": feedback,
+            }));
+        }
+        m
+    };
 
     let request_model = if state.provider == ModelProvider::Copilot {
         normalize_copilot_model_id(&state.model_name)
@@ -3601,13 +4610,15 @@ fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
         state.model_name.clone()
     };
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": request_model,
         "temperature": 0.1,
         "messages": messages,
-        "tools": tools_value,
-        "tool_choice": "auto",
     });
+    if tools_value.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+        body["tools"] = tools_value;
+        body["tool_choice"] = serde_json::json!("auto");
+    }
 
     let (chat_url, provider_label) = match state.provider {
         ModelProvider::Xai => (
@@ -3693,89 +4704,75 @@ fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
         )
     })?;
 
-    // Print context window usage for this step
-    {
+    let perf_meta = {
         let u = &payload["usage"];
-        let prompt     = u["prompt_tokens"].as_u64().unwrap_or(0);
-        let completion = u["completion_tokens"].as_u64().unwrap_or(0);
-        let thought    = usage_thought_tokens(u);
-        let total      = u["total_tokens"].as_u64().unwrap_or(prompt + completion);
-        if let Some(window) = state.context_window {
-            let pct = total * 100 / window.max(1);
-            println!("[CTX] step={} {total}/{window} tokens ({pct}%)  [prompt={prompt} completion={completion}]", req.step);
-        } else {
-            println!("[CTX] step={} prompt={prompt} completion={completion} total={total}", req.step);
-        }
-
-        let elapsed = req_started.elapsed().as_secs_f64();
-        let safe_elapsed = elapsed.max(0.001);
-        let tok_per_sec = completion as f64 / safe_elapsed;
-        let output_tokens = completion + thought;
-        if thought > 0 {
-            println!(
-                "[PERF] step={} {:.2} tok/s elapsed={:.2}s [completion={} thought={} output={} total={}]",
-                req.step,
-                tok_per_sec,
-                elapsed,
-                completion,
-                thought,
-                output_tokens,
-                total,
-            );
-        } else {
-            println!(
-                "[PERF] step={} {:.2} tok/s elapsed={:.2}s [completion={} output={} total={}]",
-                req.step,
-                tok_per_sec,
-                elapsed,
-                completion,
-                output_tokens,
-                total,
-            );
-        }
-    }
+        let prompt_tokens = u["prompt_tokens"].as_u64().unwrap_or(0);
+        let completion_tokens = u["completion_tokens"].as_u64().unwrap_or(0);
+        let thought_tokens = usage_thought_tokens(u);
+        let total_tokens = u["total_tokens"].as_u64().unwrap_or(prompt_tokens + completion_tokens);
+        let elapsed_s = req_started.elapsed().as_secs_f64();
+        let output_tokens = completion_tokens + thought_tokens;
+        let tok_per_sec = output_tokens as f64 / elapsed_s.max(0.001);
+        let context_window = state.context_window;
+        let context_pct = context_window.map(|window| total_tokens * 100 / window.max(1));
+        serde_json::json!({
+            "duration_s": elapsed_s,
+            "step": req.step,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "thought_tokens": thought_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "tok_per_sec": tok_per_sec,
+            "context_window": context_window,
+            "context_pct": context_pct,
+        })
+    };
 
     let message = &payload["choices"][0]["message"];
 
-    // Native tool calling: if model returned tool_calls, dispatch the first one
+    // Native tool calling: provider may return one or multiple tool calls.
     if let Some(tool_calls) = message["tool_calls"].as_array() {
-        if let Some(tc) = tool_calls.first() {
-            let tool_call_id = tc["id"].as_str().unwrap_or("").to_string();
-            let tool_name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-            let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
-            let args: serde_json::Value = serde_json::from_str(args_str)
-                .unwrap_or_else(|_| serde_json::json!({}));
+        if !tool_calls.is_empty() {
+            let mut invocations: Vec<ToolInvocation> = Vec::new();
+            for tc in tool_calls {
+                let tool_call_id = tc["id"].as_str().unwrap_or("").to_string();
+                if tool_call_id.is_empty() {
+                    continue;
+                }
+                let tool_name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                if tool_name.is_empty() {
+                    continue;
+                }
+                let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
+                let args: serde_json::Value = serde_json::from_str(args_str)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                invocations.push(ToolInvocation {
+                    tool: tool_name,
+                    tool_call_id,
+                    args,
+                });
+            }
 
-            // Serialize the full assistant message for replay in the next turn
-            let assistant_msg_json = serde_json::to_string(message)
-                .unwrap_or_else(|_| "{}".to_string());
-
-            let code = if tool_name == "js_exec" {
-                args["code"].as_str().map(str::to_string)
-            } else {
-                None
-            };
-            let args_field = if tool_name != "js_exec" {
-                Some(args)
-            } else {
-                None
-            };
-
-            return Ok(LlmDecision::ToolCall {
-                tool: tool_name,
-                tool_call_id,
-                assistant_msg_json,
-                code,
-                args: args_field,
-            });
+            if !invocations.is_empty() {
+                // Serialize the full assistant message for replay in the next turn.
+                let assistant_msg_json = serde_json::to_string(message)
+                    .unwrap_or_else(|_| "{}".to_string());
+                return Ok(LlmDecision::ToolCall {
+                    tool_calls: invocations,
+                    assistant_msg_json,
+                    perf: Some(perf_meta),
+                });
+            }
         }
     }
 
     // No tool_calls → model is done; return its text as the final answer
-    let content = message["content"].as_str().unwrap_or("").trim().to_string();
+    let content = assistant_content_text(message);
     Ok(LlmDecision::Final {
         answer: content,
         thought: None,
+        perf: Some(perf_meta),
     })
 }
 

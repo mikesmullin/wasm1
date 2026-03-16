@@ -15,12 +15,44 @@ use serde::{Deserialize, Serialize};
 
 const BUF_SIZE: usize = 128 * 1024;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct HistoryEntry {
     tool_call_id: String,
     tool_name: String,
     assistant_msg_json: String,
     result_json: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ToolInvocation {
+    tool: String,
+    tool_call_id: String,
+    #[serde(default)]
+    args: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct GuestSeed {
+    prompt: String,
+    #[serde(default)]
+    history: Vec<HistoryEntry>,
+    #[serde(default)]
+    validation_feedback: Vec<String>,
+    #[serde(default)]
+    step: u32,
+    #[serde(default)]
+    pending_tool_calls: Vec<PendingToolCall>,
+    #[serde(default)]
+    blocked_on_approval: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PendingToolCall {
+    tool: String,
+    tool_call_id: String,
+    #[serde(default)]
+    args: serde_json::Value,
+    assistant_msg_json: String,
 }
 
 
@@ -30,6 +62,7 @@ struct GuestRequest<'a> {
     history: &'a [HistoryEntry],
     validation_feedback: &'a [String],
     step: u32,
+    unsent_tool_result_ids: &'a [String],
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,13 +70,8 @@ struct GuestRequest<'a> {
 enum LlmDecision {
     #[serde(rename = "tool_call")]
     ToolCall {
-        tool: String,
-        tool_call_id: String,
+        tool_calls: Vec<ToolInvocation>,
         assistant_msg_json: String,
-        #[serde(default)]
-        code: Option<String>,
-        #[serde(default)]
-        args: Option<serde_json::Value>,
     },
     #[serde(rename = "final")]
     Final {
@@ -57,9 +85,18 @@ enum LlmDecision {
 #[link(wasm_import_module = "host")]
 unsafe extern "C" {
     fn get_prompt(out_ptr: i32, out_cap: i32) -> i32;
+    fn get_session_seed(out_ptr: i32, out_cap: i32) -> i32;
     fn get_max_steps() -> i32;
     fn get_validate(out_ptr: i32, out_cap: i32) -> i32;
     fn get_max_validation_fails() -> i32;
+    fn save_session_checkpoint(
+        req_ptr: i32,
+        req_len: i32,
+        state_ptr: i32,
+        state_len: i32,
+        action_ptr: i32,
+        action_len: i32,
+    ) -> i32;
     fn host_log(ptr: i32, len: i32);
     fn emit_final(ptr: i32, len: i32);
     fn grok_chat(req_ptr: i32, req_len: i32, out_ptr: i32, out_cap: i32) -> i32;
@@ -576,21 +613,65 @@ pub extern "C" fn run() {
 
 fn run_inner() -> Result<(), String> {
     log_line("Starting guest agent loop");
-    let prompt = read_prompt()?;
+    let seed = read_session_seed()?;
+    let prompt = if seed.prompt.is_empty() {
+        read_prompt()?
+    } else {
+        seed.prompt
+    };
     log_line(&format!("Received prompt: {prompt}"));
 
-    let mut history: Vec<HistoryEntry> = Vec::new();
-    let mut validation_feedback: Vec<String> = Vec::new();
+    let mut history: Vec<HistoryEntry> = seed.history;
+    let mut validation_feedback: Vec<String> = seed.validation_feedback;
     let mut validation_fail_count: u32 = 0;
     let validate_fn = read_validate()?;
     let max_validation_fails = unsafe { get_max_validation_fails() };
     // max_steps: -1 = unlimited (default); >=0 = hard cap from template spec.max_steps
     let max_steps: i32 = unsafe { get_max_steps() };
-    let mut step: u32 = 0;
+    let mut step: u32 = seed.step;
+
+    if seed.blocked_on_approval && seed.pending_tool_calls.is_empty() {
+        log_line("Waiting for manual approval; no executable calls this turn");
+        return Ok(());
+    }
+
+    if !seed.pending_tool_calls.is_empty() {
+        let mut unsent_ids: Vec<String> = Vec::new();
+        for call in seed.pending_tool_calls {
+            let tool = call.tool;
+            let tool_call_id = call.tool_call_id;
+            let args = call.args;
+            let result = if tool == "js_exec" {
+                let src = args["code"].as_str().unwrap_or("").to_string();
+                run_js_in_boa(&src)
+            } else {
+                let args_str = args.to_string();
+                call_tool_dispatch(&tool, &args_str)
+            };
+            log_line(&format!("Tool result ({tool_call_id}): {result}"));
+            history.push(HistoryEntry {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool,
+                assistant_msg_json: call.assistant_msg_json,
+                result_json: result,
+            });
+            unsent_ids.push(tool_call_id);
+        }
+        checkpoint_state(
+            &prompt,
+            &history,
+            &validation_feedback,
+            step + 1,
+            "IDLE",
+            "tool_result",
+            &unsent_ids,
+        );
+        return Ok(());
+    }
 
     loop {
         if max_steps >= 0 && step >= max_steps as u32 {
-            emit_final_line("Stopped: reached max_steps limit.");
+            checkpoint_state(&prompt, &history, &validation_feedback, step, "IDLE", "step_complete", &[]);
             return Ok(());
         }
         let req = GuestRequest {
@@ -598,6 +679,7 @@ fn run_inner() -> Result<(), String> {
             history: &history,
             validation_feedback: &validation_feedback,
             step,
+            unsent_tool_result_ids: &[],
         };
         let req_json = serde_json::to_string(&req).map_err(|e| e.to_string())?;
         let llm_raw = call_host_text_grok(&req_json)?;
@@ -608,36 +690,12 @@ fn run_inner() -> Result<(), String> {
 
         match decision {
             LlmDecision::ToolCall {
-                tool,
-                tool_call_id,
-                assistant_msg_json,
-                code,
-                args,
+                tool_calls,
+                ..
             } => {
-                log_line(&format!("Tool call requested: {tool}"));
-                let result = if tool == "js_exec" {
-                    let src = code
-                        .or_else(|| {
-                            args.as_ref()
-                                .and_then(|a| a["code"].as_str())
-                                .map(str::to_string)
-                        })
-                        .unwrap_or_default();
-                    run_js_in_boa(&src)
-                } else {
-                    let args_str = args
-                        .as_ref()
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|| "{}".to_string());
-                    call_tool_dispatch(&tool, &args_str)
-                };
-                log_line(&format!("Tool result: {result}"));
-                history.push(HistoryEntry {
-                    tool_call_id,
-                    tool_name: tool,
-                    assistant_msg_json,
-                    result_json: result,
-                });
+                log_line(&format!("Tool calls requested: {}", tool_calls.len()));
+                // Host already persisted this turn (including tool_calls) in grok_chat.
+                return Ok(());
             }
             LlmDecision::Final { answer, thought } => {
                 if let Some(t) = thought {
@@ -646,6 +704,7 @@ fn run_inner() -> Result<(), String> {
                 if !validate_fn.trim().is_empty() {
                     match evaluate_validate(&validate_fn, &answer) {
                         Ok((true, _)) => {
+                            // Host already persisted the successful final decision.
                             emit_final_line(&answer);
                             return Ok(());
                         }
@@ -675,6 +734,7 @@ fn run_inner() -> Result<(), String> {
                                 result_text
                             );
                             validation_feedback.push(validation_msg);
+                            checkpoint_state(&prompt, &history, &validation_feedback, step + 1, "IDLE", "validation_failed", &[]);
                         }
                         Err(err) => {
                             validation_fail_count += 1;
@@ -693,18 +753,74 @@ fn run_inner() -> Result<(), String> {
                                 err
                             );
                             validation_feedback.push(validation_msg);
+                            checkpoint_state(&prompt, &history, &validation_feedback, step + 1, "IDLE", "validation_error", &[]);
                         }
                     }
                 } else {
+                    // Host already persisted the successful final decision.
                     emit_final_line(&answer);
                     return Ok(());
                 }
             }
             LlmDecision::Error { message } => {
+                // Host already persisted the LLM error decision.
                 return Err(format!("llm error: {message}"));
             }
         }
         step += 1;
+    }
+}
+
+fn read_session_seed() -> Result<GuestSeed, String> {
+    let mut out = vec![0u8; BUF_SIZE];
+    let written = unsafe { get_session_seed(out.as_mut_ptr() as i32, out.len() as i32) };
+    if written < 0 {
+        return Err(format!("get_session_seed failed with {written}"));
+    }
+    let raw = String::from_utf8(out[..written as usize].to_vec()).map_err(|e| e.to_string())?;
+    if raw.trim().is_empty() || raw.trim() == "{}" {
+        return Ok(GuestSeed {
+            prompt: "".to_string(),
+            history: Vec::new(),
+            validation_feedback: Vec::new(),
+            step: 0,
+            pending_tool_calls: Vec::new(),
+            blocked_on_approval: false,
+        });
+    }
+    serde_json::from_str(&raw).map_err(|e| e.to_string())
+}
+
+fn checkpoint_state(
+    prompt: &str,
+    history: &[HistoryEntry],
+    validation_feedback: &[String],
+    step: u32,
+    state: &str,
+    action: &str,
+    unsent_tool_result_ids: &[String],
+) {
+    let req = GuestRequest {
+        prompt,
+        history,
+        validation_feedback,
+        step,
+        unsent_tool_result_ids,
+    };
+    if let Ok(raw) = serde_json::to_string(&req) {
+        let rc = unsafe {
+            save_session_checkpoint(
+                raw.as_ptr() as i32,
+                raw.len() as i32,
+                state.as_ptr() as i32,
+                state.len() as i32,
+                action.as_ptr() as i32,
+                action.len() as i32,
+            )
+        };
+        if rc != 0 {
+            log_line(&format!("save_session_checkpoint failed: {rc}"));
+        }
     }
 }
 
