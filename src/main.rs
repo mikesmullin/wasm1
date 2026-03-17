@@ -930,13 +930,22 @@ fn main() -> Result<()> {
     };
 
     // Load template allow-list if -t was supplied
-    let (shell_allow, shell_timeout, mut system_prompt, max_steps, validate_fn, max_validation_fails, mut enabled_tools, mut auto_approve_rules, template_context_window, template_hooks, mut template_description, mut template_labels, template_model, ignore_ssl) = if let Some(ref name) = template_name {
+    let (shell_allow, shell_timeout, mut system_prompt, max_steps, validate_fn, max_validation_fails, mut enabled_tools, mut auto_approve_rules, template_context_window, template_hooks, mut template_description, mut template_labels, template_model, ignore_ssl_template) = if let Some(ref name) = template_name {
         let path = resolve_template(name, &extra_roots)?;
         println!("[HOST] Using template: {}", path.display());
         load_template(&path)?
     } else {
         (Vec::new(), SHELL_TIMEOUT_DEFAULT, None, None, None, None, all_tool_names(), Vec::new(), None, Vec::new(), None, Vec::new(), None, false)
     };
+    // WASM1_IGNORE_SSL=1/true/yes overrides the template's ignore_ssl field.
+    let ignore_ssl_env = env::var("WASM1_IGNORE_SSL")
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let ignore_ssl = ignore_ssl_template || ignore_ssl_env;
+    if ignore_ssl_env && !ignore_ssl_template {
+        println!("[HOST] SSL certificate validation disabled via WASM1_IGNORE_SSL env var");
+    }
     let effective_hooks = merge_hooks(load_global_hooks()?, template_hooks);
     println!("[HOST] Hooks loaded: {}", effective_hooks.len());
 
