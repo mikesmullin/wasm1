@@ -1,0 +1,14 @@
+[Unit]
+Description=wasm1 cron service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/workspace/tmp/wasm1
+ExecStart=/usr/bin/env wasm1 cron
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

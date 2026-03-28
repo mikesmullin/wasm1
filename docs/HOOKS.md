@@ -30,7 +30,7 @@ If two hooks share the same identity (`on` + `name`), the higher-precedence defi
 ```yaml
 hooks:
   - name: mem-save-on-user-prompt
-    on: user_prompt_submit
+    on: filter_inf_req
     when:
       channel: cli
     jobs:
@@ -132,48 +132,28 @@ Use `${{ ... }}` in hook fields.
 
 | Event | Fired by | Payload extras |
 |---|---|---|
-| `cron_tick` | `cron watch` (each interval) or `cron once` (single trigger) | `trigger: "watch"\|"once"`, `tick_at`, `agent_name`, `hook_name`, `cron.stateKey`, `cron.nowMs`, `cron.state` |
+| `on_cron` | `cron` (service loop, each schedule match) or `cron once` (single trigger) | `trigger: "watch"\|"once"`, `tick_at`, `agent_name`, `hook_name`, `cron.stateKey`, `cron.nowMs`, `cron.state` |
 
 ### Session lifecycle
 
 | Event | Blocking | Payload extras |
 |---|---|---|
-| `session_start` | no | — |
-| `session_end` | no | `exit_reason` |
+| `on_session_start` | yes | `template`, `prompt` |
+| `on_session_end` | no | `exit_reason` |
 
-### Agent lifecycle
-
-| Event | Blocking | Payload extras |
-|---|---|---|
-| `before_agent_start` | yes | `template`, `prompt` |
-| `agent_terminated_stop` | no | `step_count`, `finish_reason` |
-
-### User interaction
+### Inference lifecycle
 
 | Event | Blocking | Payload extras |
 |---|---|---|
-| `user_prompt_submit` | yes | `user_message`, `channel` |
-| `permission_request` | yes | `tool_name`, `tool_input` |
-
-### LLM output
-
-| Event | Blocking | Payload extras |
-|---|---|---|
-| `assistant_response_emit` | yes | `assistant_message` |
+| `filter_inf_req` | yes | `last_inf_req`, `status`, `should_exit` |
+| `filter_inf_res` | yes | `last_inf_res`, `status`, `should_exit` |
 
 ### Tool execution
 
 | Event | Blocking | Payload extras |
 |---|---|---|
-| `pre_tool_call` | yes | `tool_name`, `tool_input` |
-| `post_tool_call` | no | `tool_name`, `tool_input`, `tool_output` |
-| `post_tool_failure` | no | `tool_name`, `tool_input`, `error_message` |
-
-### Task lifecycle
-
-| Event | Blocking | Payload extras |
-|---|---|---|
-| `task_completed` | yes | `task_id`, `task_type`, `result_summary`, `files_changed` |
+| `filter_tool_req` | yes | `tool_name`, `tool_input` |
+| `filter_tool_res` | no | `tool_name`, `tool_input`, `tool_output?`, `error_message?`, `last_tool_res` |
 
 ---
 
@@ -207,49 +187,54 @@ A blocking hook may prevent the triggering action from proceeding.
 
 ## `cron` Subcommands
 
-The `cron` system fires `cron_tick` events on a schedule, allowing hooks and agents to perform periodic work.
+The `cron` system fires `on_cron` events on a schedule, allowing hooks and agents to perform periodic work.
 
 ### `cron once`
 
-Fires a single `cron_tick` event then exits. Useful for testing or one-shot scheduled tasks.
+Fires a single `on_cron` event then exits. Useful for testing or one-shot scheduled tasks.
 
 ```bash
 wasm1 cron once
+wasm1 cron once ontolo.+
 wasm1 cron once -v
 ```
 
-### `cron watch`
+### `cron` (service mode)
 
-Fires `cron_tick` events on each interval and loops indefinitely. Exits gracefully on `SIGINT` after the current trigger finishes.
+Runs persistently and re-reads `config.yaml` each loop. Matching `schedule` entries trigger `on_cron` hooks.
 
 ```bash
-wasm1 cron watch
-wasm1 cron watch -v
+wasm1 cron
+wasm1 cron -v
 ```
 
 Intended for use with a process supervisor such as systemd.
 
 ### Cron loop interval config (`config.yaml`)
 
-`cron watch` evaluates hooks on a fixed loop interval configured in workspace-root `config.yaml`:
+`cron` evaluates schedules on a fixed loop interval configured in workspace-root `config.yaml`:
 
 ```yaml
 cron:
   interval_ms: 60000
+schedule:
+  - "* * * * * *"
+  - "* * * * * ontologist"
+  - "*/5 * * * * onto.+"
 ```
 
 - Default: `60000` (1 minute)
 - If `config.yaml` is missing at cron startup, runtime creates it automatically with this default.
-- This interval is an upper bound on scheduling resolution: hooks cannot run more frequently than the watch loop checks.
+- This interval is an upper bound on scheduling resolution: hooks cannot run more frequently than the service loop checks.
 
 Example: even if a hook returns `nextRunInMs: 10`, if `interval_ms` is `600000` (10 minutes), that hook will not be reconsidered until the next 10-minute loop tick.
 
 ### Verbose mode (`-v`)
 
-When `-v` is passed to `cron once` or `cron watch`, runtime prints colored progress output:
+When `-v` is passed to `cron once` or `cron`, runtime prints colored progress output:
 
 - startup:
-  - each discovered `cron_tick` hook and whether it is enabled
+  - each discovered `on_cron` hook and whether it is enabled
   - total cron hook count
 - each cron iteration, per hook:
   - `RUN` or `SKIP`
@@ -285,13 +270,13 @@ samy-tracker:samy-tracker-cron-tick:
 - `nextRunAt`: absolute unix ms when hook should run next
 - Any extra keys returned by the hook's LLM output are stored verbatim
 
-`cron watch` uses `nextRunAt` to decide whether each hook is due; hooks with `nextRunAt > now` are skipped for that tick.
+The cron loop uses `nextRunAt` to decide whether each hook is due; hooks with `nextRunAt > now` are skipped for that tick.
 
 ---
 
 ## Cron LLM scheduling contract
 
-For `cron_tick` hooks that execute `llm` steps, runtime parses the final LLM output as JSON (when possible).
+For `on_cron` hooks that execute `llm` steps, runtime parses the final LLM output as JSON (when possible).
 
 Recommended fields in structured output:
 
@@ -323,7 +308,7 @@ Use hook payload variables to give the model continuity between runs:
 ```yaml
 hooks:
   - name: samy-tracker-cron-tick
-    on: cron_tick
+    on: on_cron
     jobs:
       run:
         steps:
@@ -346,23 +331,23 @@ Example decision rule:
 {"status":"noop","message":"waiting for next interval","nextRunInMs":120000 - (nowMs - priorState.lastRunAt)}
 ```
 
-This enables stable continuity in `cron watch` without requiring external schedulers per hook.
+This enables stable continuity in the persistent cron loop without requiring external schedulers per hook.
 
 ---
 
 ## systemd Service
 
-A `wasm1-cron.service` unit file is provided at the workspace root for running `cron watch` as a managed service.
+A `wasm1.service` unit file is provided at the workspace root for running `cron` as a managed service.
 
 ```ini
 [Unit]
-Description=wasm1 cron watch
+Description=wasm1 cron service
 After=network.target
 
 [Service]
 Type=simple
 WorkingDirectory=/path/to/workspace
-ExecStart=/path/to/wasm1 cron watch
+ExecStart=/path/to/wasm1 cron
 Restart=on-failure
 RestartSec=5s
 
@@ -373,10 +358,10 @@ WantedBy=multi-user.target
 Copy and adapt it, then enable with:
 
 ```bash
-systemctl --user enable --now wasm1-cron.service
+systemctl --user enable --now wasm1.service
 ```
 
-systemd acts as a process monitor: if `cron watch` crashes, systemd restarts it automatically after `RestartSec`.
+systemd acts as a process monitor: if `cron` crashes, systemd restarts it automatically after `RestartSec`.
 
 ---
 
@@ -385,7 +370,7 @@ systemd acts as a process monitor: if `cron watch` crashes, systemd restarts it 
 ```yaml
 hooks:
   - name: audit-tool-calls
-    on: post_tool_call
+    on: filter_tool_res
     jobs:
       log:
         steps:
@@ -399,7 +384,7 @@ hooks:
 ```yaml
 hooks:
   - name: block-rm-rf
-    on: pre_tool_call
+    on: filter_tool_req
     when:
       tool_name: "js_exec"
     jobs:

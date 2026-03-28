@@ -241,3 +241,38 @@ cargo run -- "Your prompt"
 [LLM → GUEST] Final answer: 17 × 23 = 391.
 [HOST] Agent loop complete.
 ```
+
+---
+
+## Cron Service Mode
+
+Run the scheduler as a long-running process:
+
+```bash
+wasm1 cron
+```
+
+One-shot ad-hoc run for matching agents:
+
+```bash
+wasm1 cron once ontolo.+
+```
+
+`cron` re-reads `config.yaml` every loop. Scheduling is configured with `schedule:` entries:
+
+```yaml
+cron:
+   interval_ms: 60000
+schedule:
+   - "* * * * * *"
+   - "* * * * * ontologist"
+   - "*/5 * * * * onto.+"
+```
+
+Schedule entry format:
+
+`<minute> <hour> <day_of_month> <month> <day_of_week> <agent_pattern>`
+
+Supported cron operators per field: `*`, `-`, `/`.
+
+For hook lifecycle names and payload details, see `docs/LOOP.md` and `docs/HOOKS.md`.

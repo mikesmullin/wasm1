@@ -838,19 +838,29 @@ fn main() -> Result<()> {
     let invocation_cwd = env::current_dir().context("failed to get current directory")?;
 
     // Parse CLI args:
-    //   wasm1 cron [once]
+    //   wasm1 cron
+    //   wasm1 cron once <agent_pattern>
     //   wasm1 [-t <template>] <prompt>
     let all_args: Vec<String> = env::args().skip(1).collect();
     if all_args.first().map(String::as_str) == Some("cron") {
-        let mode = all_args.get(1).map(String::as_str).unwrap_or("once");
+        let mut mode = "watch";
+        let mut once_agent_pattern: Option<String> = None;
         let mut cron_template: Option<String> = None;
         let mut cron_verbose = false;
-        let mut idx = 2usize;
+        let mut idx = 1usize;
+        if let Some(subcmd) = all_args.get(1).map(String::as_str) {
+            if subcmd == "once" || subcmd == "watch" {
+                mode = subcmd;
+                idx = 2;
+            }
+        }
         while idx < all_args.len() {
             match all_args[idx].as_str() {
                 "-t" | "--template" => {
                     if idx + 1 >= all_args.len() {
-                        return Err(anyhow!("usage: cargo run -- cron [once] [-t <template>] [-v]"));
+                        return Err(anyhow!(
+                            "usage: wasm1 cron [watch|once [agent_pattern]] [-t <template>] [-v]"
+                        ));
                     }
                     cron_template = Some(all_args[idx + 1].clone());
                     idx += 2;
@@ -860,13 +870,23 @@ fn main() -> Result<()> {
                     idx += 1;
                 }
                 other => {
-                    return Err(anyhow!(
-                        "unknown cron arg: {other}. usage: cargo run -- cron [once] [-t <template>] [-v]"
-                    ));
+                    if mode == "once" && once_agent_pattern.is_none() {
+                        once_agent_pattern = Some(other.to_string());
+                        idx += 1;
+                    } else {
+                        return Err(anyhow!(
+                            "unknown cron arg: {other}. usage: wasm1 cron [watch|once [agent_pattern]] [-t <template>] [-v]"
+                        ));
+                    }
                 }
             }
         }
-        return run_cron(mode, cron_template.as_deref(), cron_verbose);
+        return run_cron(
+            mode,
+            cron_template.as_deref(),
+            once_agent_pattern.as_deref(),
+            cron_verbose,
+        );
     }
     if all_args.first().map(String::as_str) == Some("clean") {
         return run_clean();
@@ -904,7 +924,7 @@ fn main() -> Result<()> {
     }
     if session_name.is_none() && template_name.is_none() && prompt.is_none() {
         return Err(anyhow!(
-            "usage: cargo run -- [clean|cron [once]|-t <template> [prompt]|-s <session_id> [prompt]]"
+            "usage: wasm1 [clean|cron [watch|once [agent_pattern]]|-t <template> [prompt]|-s <session_id> [prompt]]"
         ));
     }
     let is_resume_mode = session_name.is_some();
@@ -930,7 +950,7 @@ fn main() -> Result<()> {
     };
 
     // Load template allow-list if -t was supplied
-    let (shell_allow, shell_timeout, mut system_prompt, max_steps, validate_fn, max_validation_fails, mut enabled_tools, mut auto_approve_rules, template_context_window, template_hooks, mut template_description, mut template_labels, template_model, ignore_ssl_template) = if let Some(ref name) = template_name {
+    let (mut shell_allow, mut shell_timeout, mut system_prompt, max_steps, validate_fn, max_validation_fails, mut enabled_tools, mut auto_approve_rules, template_context_window, template_hooks, mut template_description, mut template_labels, template_model, ignore_ssl_template) = if let Some(ref name) = template_name {
         let path = resolve_template(name, &extra_roots)?;
         println!("[HOST] Using template: {}", path.display());
         load_template(&path)?
@@ -1045,11 +1065,22 @@ fn main() -> Result<()> {
         }
     }
 
-    if is_resume_mode && auto_approve_rules.is_empty() {
+    if is_resume_mode {
         if let Some(ref name) = template_name {
             if let Ok(path) = resolve_template(name, &extra_roots) {
-                if let Ok((_, _, _, _, _, _, _, rules, _, _, _, _, _, _)) = load_template(&path) {
-                    auto_approve_rules = rules;
+                if let Ok((allow, timeout, _, _, _, _, tools, rules, _, _, _, _, _, _)) = load_template(&path) {
+                    if shell_allow.is_empty() {
+                        shell_allow = allow;
+                    }
+                    if shell_timeout.is_none() {
+                        shell_timeout = timeout;
+                    }
+                    if enabled_tools.is_empty() {
+                        enabled_tools = tools;
+                    }
+                    if auto_approve_rules.is_empty() {
+                        auto_approve_rules = rules;
+                    }
                 }
             }
         }
@@ -1402,7 +1433,7 @@ fn main() -> Result<()> {
                 }
             };
 
-            let req: GuestRequest = match serde_json::from_str(&req_json) {
+            let mut req: GuestRequest = match serde_json::from_str(&req_json) {
                 Ok(v) => v,
                 Err(e) => {
                     let fallback = serde_json::to_string(&LlmDecision::Error {
@@ -1416,6 +1447,53 @@ fn main() -> Result<()> {
                 }
             };
 
+            let inf_req_payload = serde_json::json!({
+                "user_message": req.prompt,
+                "last_inf_req": req.prompt,
+                "step": req.step,
+            });
+            match run_hooks_collect(
+                caller.data().hooks.as_slice(),
+                caller.data().workspace_root.as_path(),
+                caller.data().session_id.as_str(),
+                "filter_inf_req",
+                &inf_req_payload,
+                true,
+            ) {
+                Ok(run_result) => {
+                    if let Some(reason) = run_result.blocked_reason {
+                        let decision = LlmDecision::Error {
+                            message: format!("blocked by hook filter_inf_req: {reason}"),
+                            perf: None,
+                        };
+                        let response = serde_json::to_string(&decision).unwrap_or_else(|_| {
+                            "{\"type\":\"error\",\"message\":\"serialization failed\"}".to_string()
+                        });
+                        return write_memory(&mut caller, out_ptr, out_cap, &response);
+                    }
+                    if let Some(suggestion) = run_result.last_llm_output {
+                        let suggestion = suggestion.trim();
+                        if !suggestion.is_empty() {
+                            req.prompt = format!(
+                                "{}\n\n[TOOLSHED RECOMMENDATION]\n{}",
+                                req.prompt,
+                                suggestion
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    let decision = LlmDecision::Error {
+                        message: format!("hook error filter_inf_req: {e}"),
+                        perf: None,
+                    };
+                    let response = serde_json::to_string(&decision).unwrap_or_else(|_| {
+                        "{\"type\":\"error\",\"message\":\"serialization failed\"}".to_string()
+                    });
+                    return write_memory(&mut caller, out_ptr, out_cap, &response);
+                }
+            }
+
             println!("[GUEST → LLM] step={} sending request", req.step);
             let decision = match llm_decide(caller.data(), &req) {
                 Ok(v) => v,
@@ -1427,6 +1505,41 @@ fn main() -> Result<()> {
 
             if let LlmDecision::ToolCall { tool_calls, .. } = &decision {
                 println!("[LLM → GUEST] Tool calls: {}", tool_calls.len());
+            }
+
+            let inf_res_payload = match &decision {
+                LlmDecision::ToolCall {
+                    assistant_msg_json,
+                    tool_calls,
+                    ..
+                } => serde_json::json!({
+                    "assistant_message": assistant_msg_json,
+                    "last_inf_res": assistant_msg_json,
+                    "tool_calls": tool_calls,
+                    "step": req.step,
+                }),
+                LlmDecision::Final { answer, .. } => serde_json::json!({
+                    "assistant_message": answer,
+                    "last_inf_res": answer,
+                    "termination_reason": "stop",
+                    "step": req.step,
+                }),
+                LlmDecision::Error { message, .. } => serde_json::json!({
+                    "assistant_message": message,
+                    "last_inf_res": message,
+                    "termination_reason": "error",
+                    "step": req.step,
+                }),
+            };
+            if let Ok(Some(reason)) = run_hooks(caller.data_mut(), "filter_inf_res", &inf_res_payload, true) {
+                let blocked = LlmDecision::Error {
+                    message: format!("blocked by hook filter_inf_res: {reason}"),
+                    perf: None,
+                };
+                let response = serde_json::to_string(&blocked).unwrap_or_else(|_| {
+                    "{\"type\":\"error\",\"message\":\"serialization failed\"}".to_string()
+                });
+                return write_memory(&mut caller, out_ptr, out_cap, &response);
             }
 
             let (status, action) = match &decision {
@@ -1861,7 +1974,7 @@ fn main() -> Result<()> {
                 "tool_name": name.clone(),
                 "tool_input": args.clone(),
             });
-            match run_hooks(caller.data_mut(), "pre_tool_call", &hook_payload, true) {
+            match run_hooks(caller.data_mut(), "filter_tool_req", &hook_payload, true) {
                 Ok(Some(reason)) => {
                     let escaped = serde_json::to_string(&reason).unwrap_or_else(|_| "\"blocked\"".to_string());
                     let resp = format!(r#"{{"error":{escaped}}}"#);
@@ -2042,11 +2155,15 @@ fn main() -> Result<()> {
                 Ok(output) => {
                     let _ = run_hooks(
                         caller.data_mut(),
-                        "post_tool_call",
+                        "filter_tool_res",
                         &serde_json::json!({
                             "tool_name": name,
                             "tool_input": args,
                             "tool_output": output,
+                            "last_tool_res": {
+                                "ok": true,
+                                "result": output,
+                            },
                         }),
                         false,
                     );
@@ -2054,11 +2171,15 @@ fn main() -> Result<()> {
                 Err(error_message) => {
                     let _ = run_hooks(
                         caller.data_mut(),
-                        "post_tool_failure",
+                        "filter_tool_res",
                         &serde_json::json!({
                             "tool_name": name,
                             "tool_input": args,
                             "error_message": error_message,
+                            "last_tool_res": {
+                                "ok": false,
+                                "error": error_message,
+                            },
                         }),
                         false,
                     );
@@ -2148,18 +2269,12 @@ fn main() -> Result<()> {
             "template": template_name.clone().unwrap_or_else(|| "(none)".to_string()),
             "prompt": store.data().prompt,
         });
-        if let Some(reason) = run_hooks(store.data_mut(), "before_agent_start", &payload, true)? {
-            return Err(anyhow!("blocked by hook before_agent_start: {reason}"));
+        if let Some(reason) = run_hooks(store.data_mut(), "on_session_start", &payload, true)? {
+            return Err(anyhow!("blocked by hook on_session_start: {reason}"));
         }
         if !is_resume_mode {
             write_session_snapshot(store.data_mut(), "RUNNING", "start", None, None)?;
         }
-        let _ = run_hooks(
-            store.data_mut(),
-            "session_start",
-            &serde_json::json!({}),
-            false,
-        )?;
     }
 
     run.call(&mut store, ())?;
@@ -2205,7 +2320,7 @@ fn main() -> Result<()> {
     }
     let _ = run_hooks(
         store.data_mut(),
-        "session_end",
+        "on_session_end",
         &serde_json::json!({
             "exit_reason": if had_final { "success" } else { "no_final" }
         }),
@@ -2365,31 +2480,65 @@ fn render_system_prompt_template(raw: &str, workspace_root: &Path, stdin_text: &
         .map_err(|e| anyhow!("failed rendering system_prompt template: {e}"))
 }
 
-fn load_or_init_cron_interval_ms(workspace_root: &Path) -> Result<u64> {
+#[derive(Debug, Clone)]
+struct CronScheduleEntry {
+    minute: String,
+    hour: String,
+    day_of_month: String,
+    month: String,
+    day_of_week: String,
+    agent_pattern: Regex,
+    source: String,
+}
+
+#[derive(Debug, Clone)]
+struct CronRuntimeConfig {
+    interval_ms: u64,
+    schedule: Vec<CronScheduleEntry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CronNow {
+    minute: u32,
+    hour: u32,
+    day_of_month: u32,
+    month: u32,
+    day_of_week: u32,
+    minute_bucket: i64,
+}
+
+fn load_or_init_cron_runtime_config(workspace_root: &Path) -> Result<CronRuntimeConfig> {
     let path = workspace_root.join("config.yaml");
     if !path.exists() {
         let default_cfg = serde_yaml::to_string(&serde_json::json!({
             "cron": {
                 "interval_ms": DEFAULT_CRON_INTERVAL_MS
-            }
+            },
+            "schedule": []
         }))
         .context("failed to serialize default config.yaml")?;
         fs::write(&path, default_cfg)
             .with_context(|| format!("failed to create {}", path.display()))?;
-        return Ok(DEFAULT_CRON_INTERVAL_MS);
+        return Ok(CronRuntimeConfig {
+            interval_ms: DEFAULT_CRON_INTERVAL_MS,
+            schedule: Vec::new(),
+        });
     }
 
     let text = fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     if text.trim().is_empty() {
-        return Ok(DEFAULT_CRON_INTERVAL_MS);
+        return Ok(CronRuntimeConfig {
+            interval_ms: DEFAULT_CRON_INTERVAL_MS,
+            schedule: Vec::new(),
+        });
     }
 
     let yaml_val: serde_yaml::Value = serde_yaml::from_str(&text)
         .with_context(|| format!("failed to parse {}", path.display()))?;
     let json_val = serde_json::to_value(yaml_val).context("failed to convert config YAML")?;
 
-    let interval = json_val
+    let interval_ms = json_val
         .get("cron")
         .and_then(|v| v.get("interval_ms"))
         .and_then(value_as_i64)
@@ -2397,7 +2546,140 @@ fn load_or_init_cron_interval_ms(workspace_root: &Path) -> Result<u64> {
         .map(|v| v as u64)
         .unwrap_or(DEFAULT_CRON_INTERVAL_MS);
 
-    Ok(interval)
+    let mut schedule = Vec::new();
+    if let Some(entries) = json_val.get("schedule").and_then(|v| v.as_array()) {
+        for raw in entries.iter().filter_map(|v| v.as_str()) {
+            match parse_cron_schedule_entry(raw) {
+                Ok(entry) => schedule.push(entry),
+                Err(err) => eprintln!("[cron] skipping invalid schedule entry '{raw}': {err}"),
+            }
+        }
+    }
+
+    Ok(CronRuntimeConfig {
+        interval_ms,
+        schedule,
+    })
+}
+
+fn parse_cron_schedule_entry(raw: &str) -> Result<CronScheduleEntry> {
+    let parts: Vec<&str> = raw.split_whitespace().collect();
+    if parts.len() != 6 {
+        return Err(anyhow!(
+            "expected '<min> <hour> <dom> <month> <dow> <agent_pattern>'"
+        ));
+    }
+    let agent_pattern_raw = parts[5].trim().to_string();
+    let regex_src = if agent_pattern_raw == "*" {
+        ".*".to_string()
+    } else {
+        agent_pattern_raw.clone()
+    };
+    let agent_pattern = Regex::new(&regex_src)
+        .with_context(|| format!("invalid agent regex: {agent_pattern_raw}"))?;
+
+    Ok(CronScheduleEntry {
+        minute: parts[0].to_string(),
+        hour: parts[1].to_string(),
+        day_of_month: parts[2].to_string(),
+        month: parts[3].to_string(),
+        day_of_week: parts[4].to_string(),
+        agent_pattern,
+        source: raw.to_string(),
+    })
+}
+
+fn cron_field_matches(expr: &str, value: u32, min: u32, max: u32, allow_seven_sunday: bool) -> bool {
+    for part in expr.split(',') {
+        let chunk = part.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+
+        let (base, step) = if let Some((lhs, rhs)) = chunk.split_once('/') {
+            let parsed_step = rhs.trim().parse::<u32>().ok().filter(|n| *n > 0);
+            match parsed_step {
+                Some(n) => (lhs.trim(), n),
+                None => continue,
+            }
+        } else {
+            (chunk, 1)
+        };
+
+        let (mut start, mut end) = if base == "*" {
+            (min, max)
+        } else if let Some((lhs, rhs)) = base.split_once('-') {
+            let start_v = lhs.trim().parse::<u32>().ok();
+            let end_v = rhs.trim().parse::<u32>().ok();
+            match (start_v, end_v) {
+                (Some(a), Some(b)) if a <= b => (a, b),
+                _ => continue,
+            }
+        } else {
+            match base.parse::<u32>().ok() {
+                Some(v) => (v, v),
+                None => continue,
+            }
+        };
+
+        if allow_seven_sunday {
+            if start == 7 {
+                start = 0;
+            }
+            if end == 7 {
+                end = 0;
+            }
+        }
+
+        if start < min || end > max {
+            continue;
+        }
+
+        if start <= end {
+            if value >= start && value <= end && (value - start) % step == 0 {
+                return true;
+            }
+        } else if allow_seven_sunday {
+            if value >= start || value <= end {
+                let offset = if value >= start {
+                    value - start
+                } else {
+                    (max - start + 1) + (value - min)
+                };
+                if offset % step == 0 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn cron_schedule_matches(entry: &CronScheduleEntry, now: CronNow) -> bool {
+    cron_field_matches(&entry.minute, now.minute, 0, 59, false)
+        && cron_field_matches(&entry.hour, now.hour, 0, 23, false)
+        && cron_field_matches(&entry.day_of_month, now.day_of_month, 1, 31, false)
+        && cron_field_matches(&entry.month, now.month, 1, 12, false)
+        && cron_field_matches(&entry.day_of_week, now.day_of_week, 0, 6, true)
+}
+
+fn cron_now_local() -> Result<CronNow> {
+    let now_ms = now_millis() as i64;
+    let secs = now_ms / 1000;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let mut raw = secs as libc::time_t;
+    let ptr = unsafe { libc::localtime_r(&mut raw as *mut libc::time_t, &mut tm as *mut libc::tm) };
+    if ptr.is_null() {
+        return Err(anyhow!("failed to read localtime"));
+    }
+    Ok(CronNow {
+        minute: tm.tm_min as u32,
+        hour: tm.tm_hour as u32,
+        day_of_month: tm.tm_mday as u32,
+        month: (tm.tm_mon + 1) as u32,
+        day_of_week: tm.tm_wday as u32,
+        minute_bucket: secs / 60,
+    })
 }
 
 #[derive(Debug, Default)]
@@ -2413,61 +2695,37 @@ fn c24(text: &str, r: u8, g: u8, b: u8) -> String {
     format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
 }
 
-fn run_cron(mode: &str, template_name: Option<&str>, verbose: bool) -> Result<()> {
+fn run_cron(
+    mode: &str,
+    template_name: Option<&str>,
+    once_agent_pattern: Option<&str>,
+    verbose: bool,
+) -> Result<()> {
     let workspace_root = resolve_workspace_root()?;
     env::set_current_dir(&workspace_root)
         .with_context(|| format!("failed to set current dir to {}", workspace_root.display()))?;
-    let cron_interval_ms = load_or_init_cron_interval_ms(&workspace_root)?;
     let session_id = format!("cron-{}-{}", std::process::id(), now_millis());
-    let global_hooks = load_global_hooks()?;
-    let template_hooks = if let Some(name) = template_name {
-        let path = resolve_template(name, &[])?;
-        read_hooks_from_template_file(&path)?
-    } else {
-        load_all_template_hooks()?
-    };
-    let hooks = merge_hooks(global_hooks, template_hooks)
-        .into_iter()
-        .filter(|h| h.on == "cron_tick")
-        .collect::<Vec<_>>();
 
-    if verbose {
-        println!(
-            "{} {}",
-            c24("[cron]", 120, 180, 255),
-            c24("startup: discovered cron_tick hooks", 200, 210, 220)
-        );
-        println!(
-            "{} {} {}ms ({})",
-            c24("[cron]", 120, 180, 255),
-            c24("loop interval:", 200, 210, 220),
-            c24(&cron_interval_ms.to_string(), 160, 200, 255),
-            workspace_root.join("config.yaml").display(),
-        );
-        for hook in &hooks {
-            let enabled = hook.enabled.unwrap_or(true);
-            let mark = if enabled {
-                c24("✓", 110, 220, 140)
-            } else {
-                c24("✗", 255, 160, 100)
-            };
-            let state = if enabled {
-                c24("enabled", 110, 220, 140)
-            } else {
-                c24("disabled", 255, 160, 100)
-            };
-            println!("  {} {} ({})", mark, hook.name, state);
-        }
-        println!(
-            "{} {} {}",
-            c24("[cron]", 120, 180, 255),
-            c24("hook count:", 200, 210, 220),
-            c24(&hooks.len().to_string(), 160, 200, 255)
-        );
-    }
+    let load_hooks = || -> Result<Vec<HookDef>> {
+        let global_hooks = load_global_hooks()?;
+        let template_hooks = if let Some(name) = template_name {
+            let path = resolve_template(name, &[])?;
+            read_hooks_from_template_file(&path)?
+        } else {
+            load_all_template_hooks()?
+        };
+        Ok(merge_hooks(global_hooks, template_hooks)
+            .into_iter()
+            .filter(|h| h.on == "on_cron")
+            .collect::<Vec<_>>())
+    };
 
     match mode {
         "once" => {
+            let hooks = load_hooks()?;
+            let regex_src = once_agent_pattern.unwrap_or(".*");
+            let compiled = Regex::new(if regex_src == "*" { ".*" } else { regex_src })
+                .with_context(|| format!("invalid agent regex for cron once: {regex_src}"))?;
             let stats = run_cron_tick(
                 &hooks,
                 &workspace_root,
@@ -2475,6 +2733,7 @@ fn run_cron(mode: &str, template_name: Option<&str>, verbose: bool) -> Result<()
                 template_name,
                 "once",
                 false,
+                Some(&compiled),
                 verbose,
             )?;
             if verbose {
@@ -2491,7 +2750,85 @@ fn run_cron(mode: &str, template_name: Option<&str>, verbose: bool) -> Result<()
             }
             Ok(())
         }
-        _ => Err(anyhow!("usage: wasm1 cron [once] [-t <template>] [-v]")),
+        "watch" => {
+            let mut schedule_last_fire: HashMap<String, i64> = HashMap::new();
+            loop {
+                let loop_started = Instant::now();
+                let runtime_cfg = load_or_init_cron_runtime_config(&workspace_root)?;
+                let hooks = load_hooks()?;
+                let now = cron_now_local()?;
+
+                if verbose {
+                    println!(
+                        "{} {} {} ({} entries)",
+                        c24("[cron]", 120, 180, 255),
+                        c24("tick:", 200, 210, 220),
+                        c24(&now_stamp(), 160, 200, 255),
+                        runtime_cfg.schedule.len()
+                    );
+                }
+
+                let mut aggregated = CronIterationStats::default();
+                for entry in &runtime_cfg.schedule {
+                    if !cron_schedule_matches(entry, now) {
+                        continue;
+                    }
+                    let already_fired = schedule_last_fire
+                        .get(&entry.source)
+                        .copied()
+                        .unwrap_or(-1)
+                        == now.minute_bucket;
+                    if already_fired {
+                        continue;
+                    }
+                    schedule_last_fire.insert(entry.source.clone(), now.minute_bucket);
+                    if verbose {
+                        println!(
+                            "{} {} {}",
+                            c24("[cron]", 120, 180, 255),
+                            c24("schedule match:", 200, 210, 220),
+                            entry.source
+                        );
+                    }
+                    let stats = run_cron_tick(
+                        &hooks,
+                        &workspace_root,
+                        &session_id,
+                        template_name,
+                        "watch",
+                        false,
+                        Some(&entry.agent_pattern),
+                        verbose,
+                    )?;
+                    aggregated.hooks_ran += stats.hooks_ran;
+                    aggregated.hooks_skipped += stats.hooks_skipped;
+                    aggregated.hooks_success += stats.hooks_success;
+                    aggregated.hooks_failed += stats.hooks_failed;
+                }
+                aggregated.elapsed_ms = loop_started.elapsed().as_millis();
+                if verbose {
+                    println!(
+                        "{} {} ran={}, skipped={}, success={}, failed={}, total={}ms",
+                        c24("[cron]", 120, 180, 255),
+                        c24("summary:", 200, 210, 220),
+                        c24(&aggregated.hooks_ran.to_string(), 160, 200, 255),
+                        c24(&aggregated.hooks_skipped.to_string(), 160, 200, 255),
+                        c24(&aggregated.hooks_success.to_string(), 110, 220, 140),
+                        c24(&aggregated.hooks_failed.to_string(), 255, 120, 120),
+                        c24(&aggregated.elapsed_ms.to_string(), 180, 180, 255),
+                    );
+                }
+
+                let elapsed_ms = loop_started.elapsed().as_millis() as u64;
+                let sleep_ms = runtime_cfg.interval_ms.saturating_sub(elapsed_ms);
+                if sleep_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(sleep_ms));
+                }
+            }
+        }
+        _ => Err(anyhow!(
+            "usage: wasm1 cron [watch|once [agent_pattern]] [-t <template>] [-v]"
+        )),
     }
 }
 
@@ -2609,13 +2946,14 @@ fn run_cron_tick(
     template_name: Option<&str>,
     trigger: &str,
     respect_schedule: bool,
+    agent_filter: Option<&Regex>,
     verbose: bool,
 ) -> Result<CronIterationStats> {
     let tick_started = Instant::now();
     let base_tick = now_millis();
     let mut stats = CronIterationStats::default();
 
-    for hook in hooks.iter().filter(|h| h.on == "cron_tick") {
+    for hook in hooks.iter().filter(|h| h.on == "on_cron") {
         let enabled = hook.enabled.unwrap_or(true);
         if !enabled {
             stats.hooks_skipped += 1;
@@ -2633,6 +2971,21 @@ fn run_cron_tick(
 
         let cron_state = load_cron_state(workspace_root)?;
         let agent_name = resolve_cron_agent_name(hook, template_name);
+        if let Some(filter) = agent_filter {
+            if !filter.is_match(&agent_name) {
+                stats.hooks_skipped += 1;
+                if verbose {
+                    println!(
+                        "{} {} {} ({})",
+                        c24("[cron]", 120, 180, 255),
+                        c24("SKIP", 255, 200, 120),
+                        hook.name,
+                        c24("agent regex miss", 255, 200, 120)
+                    );
+                }
+                continue;
+            }
+        }
         let state_key = format!("{}:{}", agent_name, hook.name);
         let existing_entry = cron_state
             .get(&state_key)
@@ -2674,7 +3027,7 @@ fn run_cron_tick(
         }
 
         let mut base = serde_json::json!({
-            "hook": "cron_tick",
+            "hook": "on_cron",
             "session_id": session_id,
             "timestamp": now_stamp(),
             "agent_id": "main",
@@ -2847,24 +3200,25 @@ fn run_hooks(
     payload: &serde_json::Value,
     blocking: bool,
 ) -> Result<Option<String>> {
-    run_hooks_impl(
+    Ok(run_hooks_collect(
         &state.hooks,
         &state.workspace_root,
         &state.session_id,
         event,
         payload,
         blocking,
-    )
+    )?
+    .blocked_reason)
 }
 
-fn run_hooks_impl(
+fn run_hooks_collect(
     hooks: &[HookDef],
     workspace_root: &Path,
     session_id: &str,
     event: &str,
     payload: &serde_json::Value,
     blocking: bool,
-) -> Result<Option<String>> {
+) -> Result<HookRunResult> {
     let mut base = serde_json::json!({
         "hook": event,
         "session_id": session_id,
@@ -2874,6 +3228,8 @@ fn run_hooks_impl(
     });
     merge_json_object(&mut base, payload);
 
+    let mut aggregated = HookRunResult::default();
+
     for hook in hooks
         .iter()
         .filter(|h| h.on == event && h.enabled.unwrap_or(true))
@@ -2881,22 +3237,28 @@ fn run_hooks_impl(
         if !hook_matches(hook, &base) {
             continue;
         }
-        match execute_hook(hook, &base, workspace_root) {
-            Ok(Some(reason)) => {
-                if blocking {
-                    return Ok(Some(reason));
+        match execute_hook_collect(hook, &base, workspace_root) {
+            Ok(run_result) => {
+                if let Some(last) = run_result.last_llm_output {
+                    aggregated.last_llm_output = Some(last);
+                }
+                if let Some(reason) = run_result.blocked_reason {
+                    if blocking {
+                        aggregated.blocked_reason = Some(reason);
+                        return Ok(aggregated);
+                    }
                 }
             }
-            Ok(None) => {}
             Err(err) => {
                 if blocking {
-                    return Ok(Some(format!("hook '{}' failed: {err}", hook.name)));
+                    aggregated.blocked_reason = Some(format!("hook '{}' failed: {err}", hook.name));
+                    return Ok(aggregated);
                 }
                 eprintln!("[HOOK:{}] error: {err}", hook.name);
             }
         }
     }
-    Ok(None)
+    Ok(aggregated)
 }
 
 fn hook_matches(hook: &HookDef, payload: &serde_json::Value) -> bool {
@@ -2930,10 +3292,6 @@ fn hook_matches(hook: &HookDef, payload: &serde_json::Value) -> bool {
         }
     }
     true
-}
-
-fn execute_hook(hook: &HookDef, payload: &serde_json::Value, workspace_root: &Path) -> Result<Option<String>> {
-    Ok(execute_hook_collect(hook, payload, workspace_root)?.blocked_reason)
 }
 
 fn execute_hook_collect(
@@ -3690,40 +4048,17 @@ fn write_session_snapshot(
     decision: Option<&LlmDecision>,
 ) -> Result<()> {
     let from = state.session_state.clone();
-    let messages = if !state.seed_messages.is_empty() {
-        let mut merged = state.seed_messages.clone();
-        if req.is_some() {
-            for msg in &mut merged {
-                if msg.role != "user" {
-                    continue;
-                }
-                let content = msg
-                    .verbatim
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if content.is_empty() {
-                    continue;
-                }
-                let visible = msg
-                    .meta
-                    .get("visible")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                let sent = msg
-                    .meta
-                    .get("sent")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                if visible && !sent {
-                    if let Some(meta_obj) = msg.meta.as_object_mut() {
-                        meta_obj.insert("sent".to_string(), serde_json::json!(true));
-                    } else {
-                        msg.meta = serde_json::json!({"visible": true, "sent": true});
-                    }
-                }
-            }
+    let messages = if let Some(req) = req {
+        // Rebuild from authoritative guest request state so checkpointed tool
+        // results and updated history are not dropped during resume cycles.
+        let mut rebuilt = build_session_messages(Some(req), None, &state.auto_approve_rules);
+        if let Some(dec) = decision {
+            rebuilt.extend(build_session_messages(None, Some(dec), &state.auto_approve_rules));
         }
+        state.seed_messages = rebuilt.clone();
+        rebuilt
+    } else if !state.seed_messages.is_empty() {
+        let mut merged = state.seed_messages.clone();
         if let Some(dec) = decision {
             merged.extend(build_session_messages(None, Some(dec), &state.auto_approve_rules));
         }
