@@ -33,6 +33,7 @@ enum Verbosity {
     Verbose,
     VeryVerbose,
     HookTrace,
+    HttpTrace,
 }
 
 impl Verbosity {
@@ -41,15 +42,19 @@ impl Verbosity {
     }
 
     fn is_verbose(self) -> bool {
-        matches!(self, Verbosity::Verbose | Verbosity::VeryVerbose | Verbosity::HookTrace)
+        matches!(self, Verbosity::Verbose | Verbosity::VeryVerbose | Verbosity::HookTrace | Verbosity::HttpTrace)
     }
 
     fn is_very_verbose(self) -> bool {
-        matches!(self, Verbosity::VeryVerbose | Verbosity::HookTrace)
+        matches!(self, Verbosity::VeryVerbose | Verbosity::HookTrace | Verbosity::HttpTrace)
     }
 
     fn is_hook_trace(self) -> bool {
-        matches!(self, Verbosity::HookTrace)
+        matches!(self, Verbosity::HookTrace | Verbosity::HttpTrace)
+    }
+
+    fn is_http_trace(self) -> bool {
+        matches!(self, Verbosity::HttpTrace)
     }
 }
 
@@ -876,7 +881,7 @@ fn execute_shell_emulator(
     let allowed = shell_allow.iter().any(|re| re.is_match(&full_cmd));
     if !allowed {
         return Err(format!(
-            "AI Policy Error: shell_execute command not in allow-list: \"{}\". Check template metadata.shell.allow.",
+            "AI Policy Error: shell_execute command not in allow-list: \"{}\". Check session spec.tools[<agent>].shell_execute.allow.",
             parsed.program
         ));
     }
@@ -978,6 +983,18 @@ fn execute_shell_emulator(
     }
 }
 
+/// Minimal LLM API infrastructure extracted from HostState.
+/// Passed into hook execution so `llm` steps can run in-process.
+#[derive(Clone)]
+struct LlmCallCtx {
+    client: Client,
+    api_key: String,
+    model: String,
+    provider_api_url: String,
+    context_window: Option<u64>,
+    verbosity: Verbosity,
+}
+
 struct HostState {
     prompt: String,
     final_answer: Option<String>,
@@ -1042,7 +1059,7 @@ struct HostState {
     template_labels: Vec<String>,
     /// Active agent lane for context assembly and routing.
     active_agent_id: String,
-    /// Stable primary/root lane used for legacy metadata.tools import compatibility.
+    /// Stable primary/root lane identifier.
     primary_agent_id: String,
     /// Collaborators enabled for this session.
     collaborators: Vec<String>,
@@ -1064,6 +1081,19 @@ struct HostState {
     seed_pending_calls: Vec<PendingToolCall>,
     /// Resume-mode gate: true when waiting for manual approvals and no executable work exists.
     seed_blocked_on_approval: bool,
+}
+
+impl HostState {
+    fn llm_ctx(&self) -> LlmCallCtx {
+        LlmCallCtx {
+            client: self.client.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            provider_api_url: self.provider_api_url.clone(),
+            context_window: self.context_window,
+            verbosity: self.verbosity,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1104,14 +1134,6 @@ struct SessionSeedPayload {
     step: u32,
     pending_tool_calls: Vec<PendingToolCall>,
     blocked_on_approval: bool,
-}
-
-fn carried_hook_messages(messages: &[SessionMessage]) -> Vec<SessionMessage> {
-    messages
-        .iter()
-        .filter(|m| m.role == "hook")
-        .cloned()
-        .collect()
 }
 
 fn hook_event_record_to_message(ev: &HookEventRecord, active_agent_id: &str) -> SessionMessage {
@@ -1349,7 +1371,7 @@ fn parse_provider_model(raw_model: &str) -> (ModelProvider, String) {
 
 fn print_guest_event(verbosity: Verbosity, line: &str) {
     match verbosity {
-        Verbosity::VeryVerbose | Verbosity::HookTrace => {
+        Verbosity::VeryVerbose | Verbosity::HookTrace | Verbosity::HttpTrace => {
             println!("[GUEST] {line}");
         }
         Verbosity::Verbose => {
@@ -1656,6 +1678,7 @@ Global options:
     -v                Mid verbosity: print user/assistant/tool events
     -vv               Full verbosity: host and guest debug tracing
     -vvv              Hook trace verbosity: includes hook evaluation order and step I/O
+    -vvvv             HTTP trace verbosity: includes full outbound AI request payload
 
 Commands:
     -t <template> [prompt]
@@ -1691,6 +1714,7 @@ Default stdout behavior:
     -v:   print simplified user/assistant/tool events
     -vv:  print full host/guest diagnostics
     -vvv: include detailed hook lifecycle tracing (considered/executed/order/input/output)
+    -vvvv: include outbound HTTP request URL/headers/body (auth redacted)
     -q:   suppress stdout
 
 Examples:
@@ -1722,11 +1746,30 @@ fn main() -> Result<()> {
         print_help();
         return Ok(());
     }
+    // Strip leading verbosity/quiet flags so subcommands like `cron` see a clean arg list.
+    let mut all_args = all_args;
+    let mut pre_verbosity = Verbosity::Default;
+    while all_args.first().map(|a| a.as_str()) == Some("-q")
+        || all_args.first().map(|a| a.as_str()) == Some("-v")
+        || all_args.first().map(|a| a.as_str()) == Some("-vv")
+        || all_args.first().map(|a| a.as_str()) == Some("-vvv")
+        || all_args.first().map(|a| a.as_str()) == Some("-vvvv")
+    {
+        let flag = all_args.remove(0);
+        match flag.as_str() {
+            "-q" => pre_verbosity = Verbosity::Quiet,
+            "-v" => if !pre_verbosity.is_quiet() { pre_verbosity = Verbosity::Verbose; },
+            "-vv" => if !pre_verbosity.is_quiet() { pre_verbosity = Verbosity::VeryVerbose; },
+            "-vvv" => if !pre_verbosity.is_quiet() { pre_verbosity = Verbosity::HookTrace; },
+            "-vvvv" => if !pre_verbosity.is_quiet() { pre_verbosity = Verbosity::HttpTrace; },
+            _ => {}
+        }
+    }
     if all_args.first().map(String::as_str) == Some("cron") {
         let mut mode = "watch";
         let mut once_agent_pattern: Option<String> = None;
         let mut cron_template: Option<String> = None;
-        let mut cron_verbose = false;
+        let mut cron_verbose = pre_verbosity.is_verbose();
         let mut idx = 1usize;
         if let Some(subcmd) = all_args.get(1).map(String::as_str) {
             if subcmd == "once" || subcmd == "watch" {
@@ -1779,7 +1822,7 @@ fn main() -> Result<()> {
     let mut prompt: Option<String> = None;
     let mut exec_command: Option<String> = None;
     let mut as_template: Option<String> = None;
-    let mut verbosity = Verbosity::Default;
+    let mut verbosity = pre_verbosity;
     while let Some(arg) = args_iter.next() {
         if arg == "-t" || arg == "--template" {
             template_name = Some(
@@ -1798,6 +1841,10 @@ fn main() -> Result<()> {
         } else if arg == "-v" {
             if !verbosity.is_quiet() {
                 verbosity = Verbosity::Verbose;
+            }
+        } else if arg == "-vvvv" {
+            if !verbosity.is_quiet() {
+                verbosity = Verbosity::HttpTrace;
             }
         } else if arg == "-vv" {
             if !verbosity.is_quiet() {
@@ -1834,7 +1881,7 @@ fn main() -> Result<()> {
     }
     if session_name.is_none() && template_name.is_none() && prompt.is_none() {
         return Err(anyhow!(
-            "usage: wasm1 [-q|-v|-vv|-vvv] [clean|cron [watch|once [agent_pattern]]|-t <template> [prompt]|-s <session_id> [prompt]|-s <session_id> exec <command>]"
+            "usage: wasm1 [-q|-v|-vv|-vvv|-vvvv] [clean|cron [watch|once [agent_pattern]]|-t <template> [prompt]|-s <session_id> [prompt]|-s <session_id> exec <command>]"
         ));
     }
     let is_resume_mode = session_name.is_some();
@@ -1966,12 +2013,10 @@ fn main() -> Result<()> {
                 session_system_prompts.insert(lane_id, sys);
             }
         }
-        if session_agent_tools.is_empty() && !metadata.tools.is_empty() {
-            let lane_id = active_agent_id.clone().unwrap_or_else(|| make_agent_id("agent"));
-            session_agent_tools.insert(lane_id, tool_entries_from_names(&metadata.tools));
-        }
-        if !metadata.tools.is_empty() {
-            enabled_tools = metadata.tools.clone();
+        if !metadata.tools.is_empty() && verbosity.is_very_verbose() {
+            println!(
+                "[HOST] Ignoring deprecated session metadata.tools; using spec.tools only"
+            );
         }
         if template_description.is_none() {
             template_description = metadata.description.clone();
@@ -2066,7 +2111,15 @@ fn main() -> Result<()> {
     }
     if session_agent_tools.is_empty() {
         let lane_id = active_agent_id.clone().unwrap_or_else(|| make_agent_id("agent"));
-        session_agent_tools.insert(lane_id, tool_entries_from_names(&enabled_tools));
+        // Prefer raw YAML entries (preserves allow/auto_approve policy) from template when available.
+        let entries = if let Some(ref name) = template_name {
+            resolve_template(name, &extra_roots)
+                .and_then(|p| load_template_tool_entries(&p))
+                .unwrap_or_else(|_| tool_entries_from_names(&enabled_tools))
+        } else {
+            tool_entries_from_names(&enabled_tools)
+        };
+        session_agent_tools.insert(lane_id, entries);
     }
     if !legacy_hook_events.is_empty() {
         let lane_agent_id = active_agent_id.clone().unwrap_or_else(|| make_agent_id("agent"));
@@ -2154,6 +2207,28 @@ fn main() -> Result<()> {
             }
         }
         effective_hooks = merge_hooks(global_hooks.clone(), template_hook_union);
+    } else {
+        // New session: also activate collaborator hooks from template_default_collaborators.
+        let mut active_templates: Vec<String> = Vec::new();
+        if let Some(root_name) = template_name.clone() {
+            active_templates.push(root_name);
+        }
+        for c in &template_default_collaborators {
+            if !active_templates.iter().any(|n| n == c) {
+                active_templates.push(c.clone());
+            }
+        }
+        if active_templates.len() > 1 {
+            let mut template_hook_union: Vec<HookDef> = effective_hooks.clone();
+            for tmpl in active_templates.iter().skip(1) {
+                if let Ok(path) = resolve_template(tmpl, &extra_roots) {
+                    if let Ok((_, _, _, _, _, _, _, _, _, hooks, _, _, _, _)) = load_template(&path) {
+                        template_hook_union = merge_hooks(template_hook_union, hooks);
+                    }
+                }
+            }
+            effective_hooks = merge_hooks(global_hooks.clone(), template_hook_union);
+        }
     }
 
     let resolved_active_agent_id = active_agent_id
@@ -2405,7 +2480,7 @@ fn main() -> Result<()> {
         |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| {
             if let Ok(answer) = read_memory(&mut caller, ptr, len) {
                 match caller.data().verbosity {
-                    Verbosity::VeryVerbose | Verbosity::HookTrace => println!("[HOST] Agent loop complete. Final answer: {answer}"),
+                    Verbosity::VeryVerbose | Verbosity::HookTrace | Verbosity::HttpTrace => println!("[HOST] Agent loop complete. Final answer: {answer}"),
                     Verbosity::Verbose => println!("assistant: {answer}"),
                     Verbosity::Default => println!("{answer}"),
                     Verbosity::Quiet => {}
@@ -2590,6 +2665,7 @@ fn main() -> Result<()> {
                     "step": req.step,
                     "phase": "filter_inf_req",
                 });
+                let llm_ctx_for_hooks = caller.data().llm_ctx();
                 match run_hooks_collect(
                     caller.data().hooks.as_slice(),
                     caller.data().workspace_root.as_path(),
@@ -2598,24 +2674,31 @@ fn main() -> Result<()> {
                     &inf_req_payload,
                     true,
                     caller.data().verbosity,
+                    Some(&llm_ctx_for_hooks),
                 ) {
                 Ok(run_result) => {
                     if !run_result.events.is_empty() {
                         let active_agent_id = caller.data().active_agent_id.clone();
+                        let mut any_executed = false;
                         for ev in &run_result.events {
                             if ev.reason.as_deref() == Some("event_mismatch") {
                                 continue;
                             }
                             let msg = hook_event_record_to_message(ev, &active_agent_id);
                             caller.data_mut().seed_messages.push(msg);
+                            if ev.executed {
+                                any_executed = true;
+                            }
                         }
-                        let last = run_result.events.last().cloned();
-                        caller.data_mut().hook_state = serde_json::json!({
-                            "last_event": "filter_inf_req",
-                            "last_hook_id": last.as_ref().map(|e| e.id.clone()),
-                            "last_timestamp": now_stamp(),
-                            "blocked": run_result.blocked_reason.is_some(),
-                        });
+                        if any_executed {
+                            let last = run_result.events.last().cloned();
+                            caller.data_mut().hook_state = serde_json::json!({
+                                "last_event": "filter_inf_req",
+                                "last_hook_id": last.as_ref().map(|e| e.id.clone()),
+                                "last_timestamp": now_stamp(),
+                                "blocked": run_result.blocked_reason.is_some(),
+                            });
+                        }
                     }
                     if let Some(reason) = run_result.blocked_reason {
                         let decision = LlmDecision::Error {
@@ -2632,8 +2715,8 @@ fn main() -> Result<()> {
                         if !suggestion.is_empty() {
                             req.prompt = format!(
                                 "{}\n\n{}",
-                                req.prompt,
-                                suggestion
+                                suggestion,
+                                req.prompt
                             );
                             req.prompt_origin = Some("hook".to_string());
                         }
@@ -2655,6 +2738,18 @@ fn main() -> Result<()> {
             if caller.data().verbosity.is_very_verbose() {
                 println!("[GUEST → LLM] step={} sending request", req.step);
             }
+
+            // Ensure the user prompt is marked as sent in seed_messages before inference.
+            {
+                let last_unsent_idx = caller.data().seed_messages.iter().rposition(|m| {
+                    m.role == "user"
+                        && !m.meta.get("sent").and_then(|v| v.as_bool()).unwrap_or(true)
+                });
+                if let Some(idx) = last_unsent_idx {
+                    caller.data_mut().seed_messages[idx].meta["sent"] = serde_json::json!(true);
+                }
+            }
+
             let decision = match llm_decide(caller.data(), &req) {
                 Ok(v) => v,
                 Err(err) => LlmDecision::Error {
@@ -2715,6 +2810,13 @@ fn main() -> Result<()> {
             if let Err(e) = write_session_snapshot(caller.data_mut(), status, action, Some(&req), Some(&decision)) {
                 eprintln!("[HOST] session snapshot write failed: {e:#}");
             }
+
+            let turn_end_payload = serde_json::json!({
+                "step": req.step,
+                "phase": "on_turn_end",
+                "status": status,
+            });
+            let _ = run_hooks(caller.data_mut(), "on_turn_end", &turn_end_payload, false);
 
             let response = serde_json::to_string(&decision).unwrap_or_else(|_| {
                 "{\"type\":\"error\",\"message\":\"serialization failed\"}".to_string()
@@ -3383,6 +3485,13 @@ fn main() -> Result<()> {
                 }
             }
 
+            let _ = run_hooks(
+                caller.data_mut(),
+                "on_turn_end",
+                &serde_json::json!({"phase": "on_turn_end", "tool_name": name}),
+                false,
+            );
+
             let resp = match result {
                 Ok(r) => {
                     let escaped = serde_json::to_string(&r).unwrap_or_else(|_| "\"\"".to_string());
@@ -3475,17 +3584,93 @@ fn main() -> Result<()> {
     let instance = linker.instantiate(&mut store, &module)?;
     let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
 
-    {
+    // Fire on_session_start hooks if this is a new session, or the first resume
+    // of a session created by init_only_new_session (hook_state is still Null).
+    let needs_on_session_start = !is_resume_mode || store.data().hook_state.is_null();
+    if needs_on_session_start {
+        let primary_system_prompt = store
+            .data()
+            .system_prompts
+            .get(&store.data().primary_agent_id)
+            .cloned()
+            .or_else(|| store.data().system_prompt.clone())
+            .unwrap_or_default();
         let payload = serde_json::json!({
             "template": template_name.clone().unwrap_or_else(|| "(none)".to_string()),
             "prompt": store.data().prompt,
+            "user_message": store.data().prompt,
+            "session_primary_system_prompt": primary_system_prompt,
         });
-        if let Some(reason) = run_hooks(store.data_mut(), "on_session_start", &payload, true)? {
+        let llm_ctx = store.data().llm_ctx();
+        let run_result = run_hooks_collect(
+            &store.data().hooks.clone(),
+            &store.data().workspace_root.clone(),
+            &store.data().session_id.clone(),
+            "on_session_start",
+            &payload,
+            true,
+            store.data().verbosity,
+            Some(&llm_ctx),
+        )?;
+        if !run_result.events.is_empty() {
+            let active_id = store.data().active_agent_id.clone();
+            let mut any_executed = false;
+            for ev in &run_result.events {
+                if ev.reason.as_deref() == Some("event_mismatch") {
+                    continue;
+                }
+                store.data_mut().seed_messages.push(
+                    hook_event_record_to_message(ev, &active_id),
+                );
+                if ev.executed {
+                    any_executed = true;
+                }
+            }
+            if any_executed {
+                let last = run_result.events.last().cloned();
+                store.data_mut().hook_state = serde_json::json!({
+                    "last_event": "on_session_start",
+                    "last_hook_id": last.as_ref().map(|e| e.id.clone()),
+                    "last_timestamp": now_stamp(),
+                    "blocked": run_result.blocked_reason.is_some(),
+                });
+            }
+        }
+        // Mark on_session_start as attempted even if no hooks executed,
+        // so we don't re-fire on every subsequent resume.
+        if store.data().hook_state.is_null() {
+            store.data_mut().hook_state = serde_json::json!({
+                "last_event": "on_session_start",
+                "last_hook_id": null,
+                "last_timestamp": now_stamp(),
+                "blocked": false,
+            });
+        }
+        if let Some(reason) = run_result.blocked_reason {
             return Err(anyhow!("blocked by hook on_session_start: {reason}"));
         }
-        if !is_resume_mode {
-            write_session_snapshot(store.data_mut(), "RUNNING", "start", None, None)?;
+        // Apply enrichment: if the on_session_start hook produced LLM output,
+        // prepend it to the user prompt so it's included in the first inference.
+        if let Some(suggestion) = run_result.last_llm_output {
+            let suggestion = suggestion.trim();
+            if !suggestion.is_empty() {
+                let enriched = format!("{}\n\n{}", suggestion, store.data().prompt);
+                store.data_mut().prompt = enriched.clone();
+                // Update the unsent user message in seed_messages with the enriched prompt.
+                let last_unsent_idx = store.data().seed_messages.iter().rposition(|m| {
+                    m.role == "user"
+                        && !m.meta.get("sent").and_then(|v| v.as_bool()).unwrap_or(true)
+                });
+                if let Some(idx) = last_unsent_idx {
+                    let msg = &mut store.data_mut().seed_messages[idx];
+                    msg.verbatim["content"] = serde_json::json!(enriched);
+                    msg.meta["origin"] = serde_json::json!("hook");
+                }
+            }
         }
+        // Write snapshot for new-session or first-resume-with-enrichment.
+        let action = if is_resume_mode { "resume_enriched" } else { "start" };
+        write_session_snapshot(store.data_mut(), "RUNNING", action, None, None)?;
     }
 
     run.call(&mut store, ())?;
@@ -4371,7 +4556,7 @@ fn run_cron_tick(
 
         let hook_started = Instant::now();
         stats.hooks_ran += 1;
-        let run = execute_hook_collect(hook, &base, workspace_root, Verbosity::Default);
+        let run = execute_hook_collect(hook, &base, workspace_root, Verbosity::Default, None);
         match run {
             Ok(run_result) => {
                 let mut latest_state = load_cron_state(workspace_root)?;
@@ -4530,6 +4715,7 @@ fn run_hooks(
     payload: &serde_json::Value,
     blocking: bool,
 ) -> Result<Option<String>> {
+    let llm_ctx = state.llm_ctx();
     let run_result = run_hooks_collect(
         &state.hooks,
         &state.workspace_root,
@@ -4538,8 +4724,10 @@ fn run_hooks(
         payload,
         blocking,
         state.verbosity,
+        Some(&llm_ctx),
     )?;
     if !run_result.events.is_empty() {
+        let mut any_executed = false;
         for ev in &run_result.events {
             if ev.reason.as_deref() == Some("event_mismatch") {
                 continue;
@@ -4547,14 +4735,22 @@ fn run_hooks(
             state
                 .seed_messages
                 .push(hook_event_record_to_message(ev, &state.active_agent_id));
+            if ev.executed {
+                any_executed = true;
+            }
         }
-        let last = run_result.events.last().cloned();
-        state.hook_state = serde_json::json!({
-            "last_event": event,
-            "last_hook_id": last.as_ref().map(|e| e.id.clone()),
-            "last_timestamp": now_stamp(),
-            "blocked": run_result.blocked_reason.is_some(),
-        });
+        // Only update hook_state when a real hook actually executed.
+        // Non-matching events (event_mismatch, disabled, when_mismatch)
+        // must not overwrite the enrichment marker from filter_inf_req.
+        if any_executed {
+            let last = run_result.events.last().cloned();
+            state.hook_state = serde_json::json!({
+                "last_event": event,
+                "last_hook_id": last.as_ref().map(|e| e.id.clone()),
+                "last_timestamp": now_stamp(),
+                "blocked": run_result.blocked_reason.is_some(),
+            });
+        }
     }
     Ok(run_result.blocked_reason)
 }
@@ -4600,6 +4796,7 @@ fn run_hooks_collect(
     payload: &serde_json::Value,
     blocking: bool,
     verbosity: Verbosity,
+    llm_ctx: Option<&LlmCallCtx>,
 ) -> Result<HookRunResult> {
     let mut base = serde_json::json!({
         "hook": event,
@@ -4718,7 +4915,7 @@ fn run_hooks_collect(
             );
         }
 
-        match execute_hook_collect(hook, &base, workspace_root, verbosity) {
+        match execute_hook_collect(hook, &base, workspace_root, verbosity, llm_ctx) {
             Ok(run_result) => {
                 let last_llm_output = run_result.last_llm_output.clone();
                 let last_step_output = run_result.last_step_output.clone();
@@ -4837,6 +5034,7 @@ fn execute_hook_collect(
     payload: &serde_json::Value,
     workspace_root: &Path,
     verbosity: Verbosity,
+    llm_ctx: Option<&LlmCallCtx>,
 ) -> Result<HookRunResult> {
     let mut completed: HashMap<String, ()> = HashMap::new();
     let mut outputs: HashMap<String, String> = HashMap::new();
@@ -4873,7 +5071,7 @@ fn execute_hook_collect(
                         output_keys.join(",")
                     );
                 }
-                let step_out = execute_hook_step(step, payload, &outputs, workspace_root)
+                let step_out = execute_hook_step(step, payload, &outputs, workspace_root, llm_ctx)
                     .with_context(|| format!("job={job_name} step={}", step.id.clone().unwrap_or_else(|| idx.to_string())))?;
                 last_step_output = Some(step_out.clone());
                 if verbosity.is_hook_trace() {
@@ -4919,11 +5117,151 @@ fn execute_hook_collect(
     })
 }
 
+/// Run a hook `llm` step entirely in-process: no child processes.
+/// Loads the sub-agent template, builds a minimal HostState, then loops
+/// llm_decide → execute tool calls (inline) until a final answer is produced.
+fn run_llm_hook_inline(
+    ctx: &LlmCallCtx,
+    template_name: &str,
+    prompt: &str,
+    workspace_root: &Path,
+) -> Result<String> {
+    let extra_roots: Vec<&Path> = vec![workspace_root];
+    let path = resolve_template(template_name, &extra_roots)?;
+
+    let (shell_allow, shell_timeout, system_prompt, max_steps, _, _, tool_names, auto_rules, tpl_ctx_window, _, _, _, tpl_model, _ignore_ssl) =
+        load_template(&path)?;
+    let tool_entries = load_template_tool_entries(&path)?;
+
+    // Resolve model — prefer sub-agent template override, fall back to parent.
+    let model = tpl_model.unwrap_or_else(|| ctx.model.clone());
+    let (provider, model_name) = parse_provider_model(&model);
+    let context_window = lookup_model_context_window(&model).or(tpl_ctx_window).or(ctx.context_window);
+
+    // Build sub-agent identity and tool map.
+    let agent_id = make_agent_id(template_name);
+    let mut agent_tools: IndexMap<String, Vec<serde_yaml::Value>> = IndexMap::new();
+    agent_tools.insert(agent_id.clone(), tool_entries);
+    let mut system_prompts: IndexMap<String, String> = IndexMap::new();
+    if let Some(ref sp) = system_prompt {
+        system_prompts.insert(agent_id.clone(), sp.clone());
+    }
+
+    // Leave seed_messages empty so llm_decide uses the simpler history-based context path
+    // (system_prompt + initial prompt + history entries). This avoids the subscriber-filtering
+    // complexity of build_context_for_agent for inline sub-agents.
+
+    // Build a minimal HostState sufficient for llm_decide.
+    let mut sub_state = HostState {
+        prompt: prompt.to_string(),
+        final_answer: None,
+        api_key: ctx.api_key.clone(),
+        provider,
+        model_name,
+        provider_api_url: ctx.provider_api_url.clone(),
+        model,
+        client: ctx.client.clone(),
+        verbosity: ctx.verbosity,
+        wasi: WasiCtxBuilder::new().build(),
+        tcow_path: String::new(),
+        pending_writes: Vec::new(),
+        shell_allow,
+        shell_timeout,
+        shell_cwd: "/".to_string(),
+        shell_workdir: "/".to_string(),
+        running_processes: HashMap::new(),
+        system_prompt,
+        max_steps,
+        validate_fn: None,
+        max_validation_fails: None,
+        enabled_tools: tool_names,
+        agent_tools,
+        auto_approve_rules: auto_rules,
+        context_window,
+        session_id: String::new(),
+        workspace_root: workspace_root.to_path_buf(),
+        invocation_cwd: workspace_root.to_path_buf(),
+        hooks: Vec::new(),
+        session_created: now_stamp(),
+        session_state: "RUNNING".to_string(),
+        template_name: template_name.to_string(),
+        template_description: None,
+        template_labels: Vec::new(),
+        active_agent_id: agent_id.clone(),
+        primary_agent_id: agent_id.clone(),
+        collaborators: vec![template_name.to_string()],
+        system_prompts,
+        hook_state: serde_json::Value::Null,
+        skip_inf_req_hooks: true,
+        seed_history: Vec::new(),
+        seed_validation_feedback: Vec::new(),
+        seed_step: 0,
+        seed_messages: Vec::new(), // empty → llm_decide uses req.prompt + req.history path
+        seed_pending_calls: Vec::new(),
+        seed_blocked_on_approval: false,
+    };
+
+    let max = max_steps.unwrap_or(20) as usize;
+    let mut history: Vec<HistoryEntry> = Vec::new();
+    let mut cwd = "/".to_string();
+
+    for step_i in 0..max {
+        let req = GuestRequest {
+            prompt: prompt.to_string(),
+            prompt_origin: Some("hook".to_string()),
+            history: history.clone(),
+            validation_feedback: Vec::new(),
+            step: step_i as u32,
+            unsent_tool_result_ids: Vec::new(),
+        };
+
+        let decision = llm_decide(&sub_state, &req)?;
+
+        match decision {
+            LlmDecision::Final { answer, .. } => return Ok(answer),
+            LlmDecision::ToolCall { ref tool_calls, ref assistant_msg_json, .. } => {
+                for call in tool_calls {
+                    if !should_auto_approve_call(&sub_state.auto_approve_rules, call) {
+                        continue; // skip non-auto-approved calls in hook context
+                    }
+                    let result_str = if call.tool == "shell_execute" {
+                        let cmd = call.args["command"].as_str().unwrap_or("");
+                        execute_shell_emulator(
+                            &sub_state.tcow_path,
+                            &mut sub_state.pending_writes,
+                            &sub_state.shell_allow,
+                            sub_state.shell_timeout,
+                            &mut cwd,
+                            cmd,
+                        )
+                        .unwrap_or_else(|e| e)
+                    } else {
+                        format!("{{\"error\":\"tool {} not available in hook context\"}}", call.tool)
+                    };
+                    let result_json = serde_json::json!({"stdout": result_str, "result": "undefined", "error": null}).to_string();
+                    history.push(HistoryEntry {
+                        tool_call_id: call.tool_call_id.clone(),
+                        tool_name: call.tool.clone(),
+                        assistant_msg_json: assistant_msg_json.clone(),
+                        result_json,
+                    });
+                }
+            }
+            LlmDecision::Error { message, .. } => {
+                return Err(anyhow!("llm hook inline step error: {message}"));
+            }
+        }
+    }
+
+    Ok(String::new())
+}
+
 fn execute_hook_step(
     step: &HookStep,
     payload: &serde_json::Value,
     outputs: &HashMap<String, String>,
     workspace_root: &Path,
+    llm_ctx: Option<&LlmCallCtx>,
 ) -> Result<String> {
     match step.step_type.as_str() {
         "shell" => {
@@ -4957,6 +5295,13 @@ fn execute_hook_step(
             if template.is_empty() || prompt.is_empty() {
                 return Err(anyhow!("llm step requires template and prompt"));
             }
+
+            // In-process execution: run the sub-agent inline (no child processes).
+            if let Some(ctx) = llm_ctx {
+                return run_llm_hook_inline(ctx, &template, &prompt, workspace_root);
+            }
+
+            // Fallback path (no LlmCallCtx available — should not happen in normal flow).
             let exe = env::current_exe().context("cannot resolve current executable")?;
             let session_id = payload
                 .get("session_id")
@@ -4968,27 +5313,12 @@ fn execute_hook_step(
                 .join(".agent/sessions")
                 .join(format!("{session_id}.yaml"));
 
-            let nested_stdout = if session_path.exists() {
+            // Create the nested session if it doesn't exist yet.
+            let run_session_id = if session_path.exists() {
                 let _ = append_on_cron_hook_message(workspace_root, &session_id, payload);
-                let out = Command::new(&exe)
-                    .arg("-vv")
-                    .arg("-s")
-                    .arg(&session_id)
-                    .arg("--as-template")
-                    .arg(&template)
-                    .arg(&prompt)
-                    .current_dir(workspace_root)
-                    .output()
-                    .context("failed to run nested llm hook step")?;
-                if !out.status.success() {
-                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    return Err(anyhow!("nested llm hook failed (resume lane): stderr={stderr} stdout={stdout}"));
-                }
-                String::from_utf8_lossy(&out.stdout).to_string()
+                session_id.clone()
             } else {
                 let create_out = Command::new(&exe)
-                    .arg("-vv")
                     .arg("-t")
                     .arg(&template)
                     .arg(&prompt)
@@ -5001,43 +5331,19 @@ fn execute_hook_step(
                     return Err(anyhow!("nested llm hook failed (create): stderr={stderr} stdout={stdout}"));
                 }
                 let create_stdout = String::from_utf8_lossy(&create_out.stdout).to_string();
-                let created_session_id = extract_session_id_from_create_output(&create_stdout)
+                let created_id = extract_session_id_from_create_output(&create_stdout)
                     .ok_or_else(|| anyhow!("nested llm hook create output missing session id"))?;
-                let _ = append_on_cron_hook_message(workspace_root, &created_session_id, payload);
-                let run_out = Command::new(&exe)
-                    .arg("-vv")
-                    .arg("-s")
-                    .arg(&created_session_id)
-                    .current_dir(workspace_root)
-                    .output()
-                    .context("failed to step nested llm hook session")?;
-                if !run_out.status.success() {
-                    let stderr = String::from_utf8_lossy(&run_out.stderr).trim().to_string();
-                    let stdout = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
-                    return Err(anyhow!("nested llm hook failed (step): stderr={stderr} stdout={stdout}"));
-                }
-                String::from_utf8_lossy(&run_out.stdout).to_string()
+                let _ = append_on_cron_hook_message(workspace_root, &created_id, payload);
+                created_id
             };
 
-            if let Some(final_answer) = extract_nested_final_answer(&nested_stdout) {
-                return Ok(final_answer);
-            }
-            Ok(String::new())
+            // Stepwise: do NOT loop-step the session to completion.
+            // Just return the session ID so the caller can drive stepping
+            // via repeated `wasm1 -s <id>` invocations.
+            Ok(run_session_id)
         }
         other => Err(anyhow!("unsupported hook step type: {other}")),
     }
-}
-
-fn extract_nested_final_answer(stdout: &str) -> Option<String> {
-    for line in stdout.lines().rev() {
-        if let Some(rest) = line.strip_prefix("[HOST] Agent loop complete. Final answer: ") {
-            return Some(rest.trim().to_string());
-        }
-        if let Some(rest) = line.strip_prefix("assistant: ") {
-            return Some(rest.trim().to_string());
-        }
-    }
-    None
 }
 
 fn extract_session_id_from_create_output(stdout: &str) -> Option<String> {
@@ -5440,7 +5746,7 @@ fn session_seed_from_messages(messages: &[serde_json::Value]) -> (String, Vec<Hi
     let mut pending_assistant: HashMap<String, (String, String)> = HashMap::new();
     let mut approved_calls: HashMap<String, PendingToolCall> = HashMap::new();
     let mut seen_tool_results: HashSet<String> = HashSet::new();
-    let mut pending_human_approvals = false;
+    let mut pending_approval_ids: HashSet<String> = HashSet::new();
 
     for msg in messages {
         let role = msg["role"].as_str().unwrap_or("");
@@ -5453,10 +5759,16 @@ fn session_seed_from_messages(messages: &[serde_json::Value]) -> (String, Vec<Hi
                 if content.is_empty() {
                     continue;
                 }
-                if prompt.is_empty() {
-                    prompt = content;
-                } else {
+                let origin = msg
+                    .get("meta")
+                    .and_then(|m| m.get("origin"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("user");
+                if origin == "validation" {
                     validation_feedback.push(content);
+                } else {
+                    // Keep the latest non-validation user input as the active prompt.
+                    prompt = content;
                 }
             }
             "assistant" => {
@@ -5476,7 +5788,9 @@ fn session_seed_from_messages(messages: &[serde_json::Value]) -> (String, Vec<Hi
                         }
                         let tool_name = tc["function"]["name"].as_str().unwrap_or("").to_string();
                         let status = assistant_call_status(msg, &tool_call_id);
+                        let call_sent = assistant_call_sent(msg, &tool_call_id);
                         if status == "rejected" {
+                            pending_approval_ids.remove(&tool_call_id);
                             validation_feedback.push(format!(
                                 "policy rejection: user rejected tool call id={} name={} before execution.",
                                 tool_call_id, tool_name
@@ -5484,9 +5798,11 @@ fn session_seed_from_messages(messages: &[serde_json::Value]) -> (String, Vec<Hi
                             continue;
                         }
                         if status == "pending" {
-                            pending_human_approvals = true;
+                            pending_approval_ids.insert(tool_call_id.clone());
+                            continue;
                         }
-                        if !assistant_call_sent(msg, &tool_call_id) {
+                        pending_approval_ids.remove(&tool_call_id);
+                        if !call_sent && status != "approved" && status != "modified" {
                             continue;
                         }
 
@@ -5519,6 +5835,7 @@ fn session_seed_from_messages(messages: &[serde_json::Value]) -> (String, Vec<Hi
                 let status = tool_result_status(msg);
                 if status == "rejected" {
                     if !maybe_id.is_empty() {
+                        pending_approval_ids.remove(&maybe_id);
                         seen_tool_results.insert(maybe_id.clone());
                     }
                     validation_feedback.push(
@@ -5529,7 +5846,9 @@ fn session_seed_from_messages(messages: &[serde_json::Value]) -> (String, Vec<Hi
 
                 if !message_visible(msg) || !message_sent(msg) {
                     if status == "pending" {
-                        pending_human_approvals = true;
+                        if !maybe_id.is_empty() {
+                            pending_approval_ids.insert(maybe_id.clone());
+                        }
                     }
                     if let Some(id) = payload["tool_call_id"].as_str() {
                         if !id.is_empty() {
@@ -5545,6 +5864,7 @@ fn session_seed_from_messages(messages: &[serde_json::Value]) -> (String, Vec<Hi
                 if tool_call_id.is_empty() {
                     continue;
                 }
+                pending_approval_ids.remove(&tool_call_id);
                 seen_tool_results.insert(tool_call_id.clone());
                 let (fallback_name, fallback_assistant_json) = pending_assistant
                     .remove(&tool_call_id)
@@ -5588,7 +5908,7 @@ fn session_seed_from_messages(messages: &[serde_json::Value]) -> (String, Vec<Hi
             }
         })
         .collect::<Vec<_>>();
-    let blocked_on_approval = pending_human_approvals && pending_tool_calls.is_empty();
+    let blocked_on_approval = !pending_approval_ids.is_empty() && pending_tool_calls.is_empty();
     if prompt.is_empty() {
         for msg in messages.iter().rev() {
             if msg["role"].as_str().unwrap_or("") != "user" {
@@ -5919,33 +6239,62 @@ fn write_session_snapshot(
     decision: Option<&LlmDecision>,
 ) -> Result<()> {
     let from = state.session_state.clone();
-    let persisted_hook_msgs = carried_hook_messages(&state.seed_messages);
-    let messages = if let Some(req) = req {
-        // Rebuild from authoritative guest request state so checkpointed tool
-        // results and updated history are not dropped during resume cycles.
-        let mut rebuilt = build_session_messages(
-            Some(req),
-            None,
-            &state.auto_approve_rules,
-            &state.active_agent_id,
-        );
-        if let Some(dec) = decision {
-            rebuilt.extend(build_session_messages(
-                None,
-                Some(dec),
-                &state.auto_approve_rules,
-                &state.active_agent_id,
-            ));
-        }
-        if !persisted_hook_msgs.is_empty() {
-            let mut merged = persisted_hook_msgs.clone();
-            merged.extend(rebuilt);
-            rebuilt = merged;
-        }
-        state.seed_messages = rebuilt.clone();
-        rebuilt
-    } else if !state.seed_messages.is_empty() {
+    let messages = if !state.seed_messages.is_empty() {
+        // Resume path: seed_messages already contains the authoritative timeline
+        // loaded from disk. Only append NEW items (decision, unsent tool results)
+        // instead of rebuilding the entire history (which generates duplicate IDs).
         let mut merged = state.seed_messages.clone();
+
+        // If the guest just executed a tool call, the result was already appended
+        // to seed_messages by the guest checkpoint path. Mark any unsent tool
+        // results from the current req as sent if auto-approved.
+        if let Some(req) = req {
+            // Check for unsent tool results that need to be appended
+            for unsent_id in &req.unsent_tool_result_ids {
+                // Find the matching history entry for this tool result
+                if let Some(entry) = req.history.iter().find(|h| &h.tool_call_id == unsent_id) {
+                    let auto_result = should_auto_approve_result(&state.auto_approve_rules, &entry.tool_name);
+                    let sent = auto_result;
+                    let status = if auto_result { "approved" } else { "pending" };
+                    // Check if a tool result for this call_id already exists in seed_messages
+                    let already_present = merged.iter().any(|m| {
+                        m.role == "tool"
+                            && m.verbatim
+                                .get("tool_call_id")
+                                .and_then(|v| v.as_str())
+                                == Some(unsent_id)
+                    });
+                    if !already_present {
+                        merged.push(SessionMessage {
+                            id: scoped_id("event"),
+                            role: "tool".to_string(),
+                            verbatim: serde_json::json!({
+                                "tool_call_id": entry.tool_call_id,
+                                "name": entry.tool_name,
+                                "content": format_tool_result(&entry.result_json),
+                                "result_json": entry.result_json,
+                                "timestamp": now_stamp(),
+                            }),
+                            meta: serde_json::json!({
+                                "kind": "tool_result",
+                                "visible": true,
+                                "sent": sent,
+                                "origin": "tool",
+                                "subscribers": [&state.active_agent_id],
+                                "approval": {
+                                    "status": status,
+                                    "reviewed_at": null,
+                                    "reason": null,
+                                    "modified_content": null,
+                                }
+                            }),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Append the new LLM decision if present
         if let Some(dec) = decision {
             merged.extend(build_session_messages(
                 None,
@@ -5957,6 +6306,7 @@ fn write_session_snapshot(
         state.seed_messages = merged.clone();
         merged
     } else {
+        // Fresh session path: build everything from scratch
         let built = build_session_messages(req, decision, &state.auto_approve_rules, &state.active_agent_id);
         state.seed_messages = built.clone();
         built
@@ -6011,11 +6361,10 @@ fn write_session_snapshot(
                 for (k, v) in &existing.spec.tools {
                     state.agent_tools.entry(k.clone()).or_insert_with(|| v.clone());
                 }
-            } else if !existing.metadata.tools.is_empty() {
-                state
-                    .agent_tools
-                    .entry(state.primary_agent_id.clone())
-                    .or_insert_with(|| existing.metadata.tools.clone());
+            } else if !existing.metadata.tools.is_empty() && state.verbosity.is_very_verbose() {
+                println!(
+                    "[HOST] Ignoring deprecated session metadata.tools while merging snapshot; using spec.tools only"
+                );
             }
         }
     }
@@ -6836,6 +7185,9 @@ fn build_context_for_agent(state: &HostState, agent_id: &str) -> Vec<serde_json:
         }
         match msg.role.as_str() {
             "user" => {
+                if !msg.meta.get("sent").and_then(|v| v.as_bool()).unwrap_or(true) {
+                    continue;
+                }
                 let content = msg
                     .verbatim
                     .get("content")
@@ -6850,13 +7202,50 @@ fn build_context_for_agent(state: &HostState, agent_id: &str) -> Vec<serde_json:
                 }
             }
             "assistant" => {
+                if !msg.meta.get("sent").and_then(|v| v.as_bool()).unwrap_or(true) {
+                    continue;
+                }
                 let mut assistant = msg.verbatim.clone();
                 if assistant.get("role").is_none() {
                     assistant["role"] = serde_json::json!("assistant");
                 }
+
+                // Preserve only tool calls that were actually sent/approved for this turn.
+                if let Some(calls) = assistant.get("tool_calls").and_then(|v| v.as_array()) {
+                    let filtered_calls: Vec<serde_json::Value> = calls
+                        .iter()
+                        .filter(|tc| {
+                            let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                            if call_id.is_empty() {
+                                return true;
+                            }
+                            msg
+                                .meta
+                                .get("calls")
+                                .and_then(|v| v.get(call_id))
+                                .and_then(|v| v.get("sent"))
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(true)
+                        })
+                        .cloned()
+                        .collect();
+
+                    let has_content = assistant
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false);
+                    if filtered_calls.is_empty() && !has_content {
+                        continue;
+                    }
+                    assistant["tool_calls"] = serde_json::Value::Array(filtered_calls);
+                }
                 messages.push(assistant);
             }
             "tool" => {
+                if !msg.meta.get("sent").and_then(|v| v.as_bool()).unwrap_or(true) {
+                    continue;
+                }
                 let content = msg
                     .verbatim
                     .get("content")
@@ -6954,7 +7343,24 @@ fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
     // For resumed sessions, preserve exact YAML ordering and role alternation.
     // For brand-new sessions, keep legacy seed behavior.
     let messages: Vec<serde_json::Value> = if !state.seed_messages.is_empty() {
-        build_context_for_agent(state, &state.active_agent_id)
+        let mut ctx = build_context_for_agent(state, &state.active_agent_id);
+        if req.prompt_origin.as_deref() == Some("hook") {
+            let prompt = req.prompt.trim();
+            if !prompt.is_empty() {
+                if let Some(idx) = ctx
+                    .iter()
+                    .rposition(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+                {
+                    ctx[idx]["content"] = serde_json::json!(prompt);
+                } else {
+                    ctx.push(serde_json::json!({
+                        "role": "user",
+                        "content": prompt,
+                    }));
+                }
+            }
+        }
+        ctx
     } else {
         let system = state.system_prompt.as_deref().unwrap_or("");
         let initial_user = &req.prompt;
@@ -7009,6 +7415,22 @@ fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
             "Copilot",
         ),
     };
+
+    if state.verbosity.is_http_trace() {
+        let body_pretty = serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string());
+        println!("[HTTP OUT] provider={provider_label} method=POST url={chat_url}");
+        println!("[HTTP OUT] headers:");
+        println!("  Authorization: Bearer <redacted>");
+        println!("  Content-Type: application/json");
+        if state.provider == ModelProvider::Copilot {
+            println!("  Editor-Version: {COPILOT_EDITOR_VERSION}");
+            println!("  Editor-Plugin-Version: {COPILOT_EDITOR_PLUGIN_VERSION}");
+            println!("  User-Agent: {COPILOT_USER_AGENT}");
+            println!("  Copilot-Integration-Id: vscode-chat");
+            println!("  OpenAI-Intent: conversation-panel");
+        }
+        println!("[HTTP OUT] body:\n{body_pretty}");
+    }
 
     let mut last_timeout_err: Option<reqwest::Error> = None;
     let mut resp_opt = None;

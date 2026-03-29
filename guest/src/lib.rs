@@ -134,21 +134,21 @@ fn run_inner() -> Result<(), String> {
     }
 
     if !seed.pending_tool_calls.is_empty() {
-        let mut unsent_ids: Vec<String> = Vec::new();
-        for call in seed.pending_tool_calls {
-            let tool = call.tool;
-            let tool_call_id = call.tool_call_id;
-            let args_str = call.args.to_string();
-            let result = call_tool_dispatch(&tool, &args_str);
-            log_line(&format!("Tool result ({tool_call_id}): {result}"));
-            history.push(HistoryEntry {
-                tool_call_id: tool_call_id.clone(),
-                tool_name: tool,
-                assistant_msg_json: call.assistant_msg_json,
-                result_json: result,
-            });
-            unsent_ids.push(tool_call_id);
-        }
+        // Execute exactly one pending tool call per run (strict STEPWISE).
+        // Remaining calls stay pending and will be executed on subsequent resumes.
+        let call = seed.pending_tool_calls.into_iter().next().unwrap();
+        let tool = call.tool;
+        let tool_call_id = call.tool_call_id;
+        let args_str = call.args.to_string();
+        let result = call_tool_dispatch(&tool, &args_str);
+        log_line(&format!("Tool result ({tool_call_id}): {result}"));
+        history.push(HistoryEntry {
+            tool_call_id: tool_call_id.clone(),
+            tool_name: tool,
+            assistant_msg_json: call.assistant_msg_json,
+            result_json: result,
+        });
+        let unsent_ids = vec![tool_call_id];
         checkpoint_state(
             &prompt,
             &history,

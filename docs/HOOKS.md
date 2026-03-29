@@ -13,15 +13,24 @@ Use hooks for:
 
 Keep blocking hooks fast and deterministic.
 
-## Load Order and Override Rule
+## Load Order and Activation Rule
 
 Hook definitions are merged with this precedence (highest first):
 
-1. Template hooks (`metadata.hooks`)
-2. User hooks (`~/.config/daemon/agent/hooks/*.yaml`)
-3. Repo hooks (`.agent/hooks/*.yaml`)
+1. Template hooks (`metadata.hooks`) — **activation rules apply** (see below)
+2. User hooks (`~/.config/daemon/agent/hooks/*.yaml`) — always active
+3. Repo hooks (`.agent/hooks/*.yaml`) — always active
 
 If two hooks share the same identity (`on` + `name`), the higher-precedence definition wins.
+
+### Template hook activation
+
+Template hooks are only active if their source template is **participating in the session**:
+
+- The root agent template (the one that started the session, named in `metadata.name`) always has its hooks active.
+- Other templates' hooks are only active if their template name appears in `metadata.collaborators`.
+
+This means you can define hooks in `toolshed.yaml` that only activate when a session explicitly includes `toolshed` as a collaborator.
 
 ---
 
@@ -39,9 +48,8 @@ hooks:
           - id: proposed
             type: llm
             template: memory-user-extract
-            stdin: |
-              User: ${{ user_message }}
-            prompt: go
+            prompt: |
+              User: ${{ last_inf_req }}
 
           - id: existing
             type: shell
@@ -89,7 +97,7 @@ Use `${{ ... }}` in hook fields.
 
 ### Available Roots
 
-- Event payload keys directly, e.g. `${{ user_message }}`
+- Event payload keys directly, e.g. `${{ last_inf_req }}`
 - Step output by id, e.g. `${{ steps.proposed.output }}`
 
 ### Functions
@@ -122,7 +130,7 @@ Use `${{ ... }}` in hook fields.
 |---|---|
 | Exact | `when: { channel: cli }` |
 | Any-of | `when: { response_channel: [cli, api] }` |
-| Wildcard | `when: { tool_name: "shell__*" }` |
+| Wildcard | `when: { tool_name: "shell_execute" }` |
 
 ---
 
@@ -145,8 +153,8 @@ Use `${{ ... }}` in hook fields.
 
 | Event | Blocking | Payload extras |
 |---|---|---|
-| `filter_inf_req` | yes | `last_inf_req`, `status`, `should_exit` |
-| `filter_inf_res` | yes | `last_inf_res`, `status`, `should_exit` |
+| `filter_inf_req` | yes | `last_inf_req`, `session_primary_system_prompt`, `step`, `phase` |
+| `filter_inf_res` | yes | `last_inf_res`, `tool_calls` (if tool call response), `step`, `phase` |
 
 ### Tool execution
 
@@ -167,8 +175,7 @@ All hooks receive a base JSON payload on stdin:
   "session_id": "sess_abc123",
   "timestamp": "2026-02-15T17:45:00Z",
   "agent_id": "main",
-  "workspace": "/path/to/project",
-  "reason": "optional prior context"
+  "workspace": "/path/to/project"
 }
 ```
 
@@ -386,7 +393,7 @@ hooks:
   - name: block-rm-rf
     on: filter_tool_req
     when:
-      tool_name: "js_exec"
+      tool_name: "shell_execute"
     jobs:
       guard:
         steps:
@@ -394,3 +401,39 @@ hooks:
             type: shell
             command: |
               echo '${{ tool_input }}' | grep -q 'rm -rf' && echo '{"blocked":true,"reason":"rm -rf denied"}' || echo '{"blocked":false}'
+```
+
+## Example: collaborator hook (toolshed auto-recommendation)
+
+Define the hook in `toolshed.yaml`. It fires only when `toolshed` is listed in `collaborators`:
+
+```yaml
+# toolshed.yaml
+metadata:
+  hooks:
+    - name: enhance-inf-req-with-toolshed
+      on: filter_inf_req
+      jobs:
+        recommend:
+          steps:
+            - id: toolshed_reco
+              type: llm
+              template: toolshed
+              prompt: |
+                Recommend applicable tools for this request:
+
+                ${{ session_primary_system_prompt }}
+
+                ${{ last_inf_req }}
+```
+
+Session that activates it:
+
+```yaml
+# .agent/sessions/<id>.yaml
+metadata:
+  name: desk-light-toggle
+  collaborators:
+    - desk-light-toggle
+    - toolshed        # ← activates toolshed hooks including enhance-inf-req-with-toolshed
+```

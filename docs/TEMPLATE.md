@@ -25,42 +25,148 @@ spec:
 | `metadata` | object | yes | Runtime + behavior config. |
 | `spec` | object | yes | Prompt and execution-facing data. |
 
-## Session Snapshot Schema (Collaborative Runtime)
+## Session Snapshot Schema
 
 `wasm1` persists session snapshots under `.agent/sessions/<session_id>.yaml`.
-The runtime now supports collaborative lanes inside one session timeline.
+Sessions support collaborative lanes: multiple agents sharing one ordered timeline, each with its own
+system prompt, tool policy, and context subscription.
 
-### Metadata additions
+### Collaborative participants (`metadata.collaborators`)
 
-| Field | Type | Notes |
-|---|---|---|
-| `metadata.participants` | array | Participating agents for this session. Each item has `agent_id`. |
-| `metadata.system_prompts` | map | Per-agent system prompt map keyed by `agent_id`. |
+```yaml
+metadata:
+  collaborators:
+    - desk-light-toggle   # root agent (always first)
+    - toolshed            # collaborator — activates toolshed hooks
+```
+
+`collaborators` is a list of template names. It determines which templates' `metadata.hooks` are active in the session. The root agent's hooks are always active. Any other template listed here also has its hooks activated.
+
+Agent IDs for each participant are generated at session creation and recorded in `spec.system_prompts` (see below).
+
+### Per-agent system prompts (`spec.system_prompts`)
+
+System prompts are stored per agent, keyed by agent ID:
+
+```yaml
+spec:
+  system_prompts:
+    agent-desk-light-toggle-1774753727414-480c25: |
+      You are a desk-light automation assistant.
+    agent-toolshed-1774753727733-6e9b85: |
+      You are toolshed, a tool-recommendation specialist.
+```
+
+The agent ID format is `agent-<template>-<ts>-<short_hash>`. The appropriate system prompt is selected
+per inference request based on the active agent lane.
+
+### Per-agent tool policy (`spec.tools`)
+
+Tools and their policy are stored per agent:
+
+```yaml
+spec:
+  tools:
+    agent-desk-light-toggle-1774753727414-480c25:
+      - shell_execute         # simple string = tool enabled, no inline policy
+    agent-toolshed-1774753727733-6e9b85:
+      - shell_execute:
+          allow:
+            - '^skills'
+            - '^echo'
+          auto_approve:
+            - '^skills($|\s)'
+            - '^echo($|\s)'
+```
+
+Tool policy is frozen at session creation from each agent's template. Agents cannot amend their tool list mid-session. When a collaborator is added to the session its tool policy is snapshotted at that point.
 
 ### Message model
 
 Each timeline entry in `spec.messages[]` stores:
 
-- `id`: stable event id (`event-<ts>-<short_hash>`)
-- `role`: provider-facing role (`user`, `assistant`, `tool`, ...)
-- `verbatim`: provider-safe payload fields
-- `meta`: local orchestration/audit fields
+- `id`: stable event id (`event-<ts>-<short_hash>` or `hook-<ts>-<short_hash>`)
+- `role`: `user`, `assistant`, `tool`, or `hook`
+- `verbatim`: provider-safe payload (only this is forwarded to LLM API)
+- `meta`: local orchestration/audit fields (never forwarded to LLM API)
 
 Common `meta` fields:
 
-- `visible`: global operator visibility gate
-- `sent`: provider inclusion gate for approval flow
-- `subscribers`: list of `agent_id` values that should receive this item in context assembly
-- `origin`: source of the event (`user`, `llm`, `tool`, `hook`, ...)
+| Field | Description |
+|---|---|
+| `visible` | Global operator gate — human-controlled boolean |
+| `sent` | Provider inclusion gate; `false` = pending approval |
+| `subscribers` | List of `agent_id` values that receive this item in context assembly |
+| `origin` | Source: `user`, `llm`, `tool`, `hook`, `validation` |
+| `kind` | Entry subtype: `tool_call_batch`, `tool_result` |
 
-### Hook observability + checkpointing
+For assistant tool-call batches, per-call approval state is stored under `meta.calls.<call_id>`:
 
-The snapshot also persists:
+```yaml
+meta:
+  kind: tool_call_batch
+  calls:
+    call_abc123:
+      sent: false
+      approval:
+        status: pending    # pending | approved | rejected | modified
+        reviewed_at: null
+        reason: null
+        modified_args: null
+```
 
-- `spec.hook_events`: append-only hook execution audit records, including input/output verbatim
-- `spec.hook_state`: resumable checkpoint metadata for hook workflow progress
+For tool result entries, approval state is at `meta.approval`:
 
-`hook_events` items include: `id`, `event`, `hook_name`, `order`, `considered`, `executed`, `blocked`, `step`, `phase`, `input_verbatim`, `output_verbatim`, and optional `reason`.
+```yaml
+meta:
+  kind: tool_result
+  sent: false
+  approval:
+    status: pending        # pending | approved | rejected | modified
+    reviewed_at: null
+    reason: null
+    modified_content: null  # if set + status=modified, sent to LLM instead of verbatim content
+```
+
+### Hook execution records in `spec.messages[]`
+
+Hook execution events are stored as `role: hook` entries inline in the messages timeline (not in a separate list). They are never forwarded to LLM API. They carry the full hook audit record:
+
+```yaml
+- id: hook-1774753727416-4235d9
+  role: hook
+  verbatim:
+    hook_name: desk-light-cron-trigger
+    event: on_cron
+    considered: true
+    executed: true
+    blocked: false
+    order: 1
+    step: 0
+    phase: on_cron
+    input_verbatim: '...'
+    output_verbatim: ''
+    reason: null
+  meta:
+    origin: hook
+    phase: on_cron
+    sent: false
+    visible: true
+    subscribers: [agent-desk-light-toggle-...]
+```
+
+### Hook checkpoint (`spec.hook_state`)
+
+```yaml
+spec:
+  hook_state:
+    last_event: filter_inf_res
+    last_hook_id: hook-1774753750927-f93ae5
+    last_timestamp: '1774753750927'
+    blocked: false
+```
+
+This is updated after each hook execution phase and used to resume hook chains across step boundaries.
 
 ## `metadata` fields
 
@@ -69,6 +175,13 @@ The snapshot also persists:
 | `description` | string | no | Human-friendly description. |
 | `model` | string | no | Provider-prefixed model string, e.g. `xai:grok-4-fast-reasoning` or `copilot:gpt-4o`. If omitted, host falls back to `XAI_MODEL` then built-in default. |
 | `context_window` | number | no | Context window size in tokens. Known xAI models are resolved automatically from a built-in table; Copilot models currently require this field for explicit window reporting. Used to display `[CTX]` usage percentages. |
+| `labels` | string[] | no | Optional tags for discovery and filtering. |
+| `hooks` | array | no | Template-local hooks. Active only when this template is the root agent or listed in `collaborators`. See [HOOKS.md](HOOKS.md). |
+| `collaborators` | string[] | no | Template names whose hooks should be active in sessions using this template. |
+| `validate` | string | no | JavaScript validation function body run against the final assistant reply (`reply` arg). Must return truthy to accept. |
+| `max_validation_fails` | number | no | Maximum validation retries before failing. Absent = unlimited retries (still bounded by `max_steps`). |
+| `tools` | array | no | Tool policy for this agent. Entries may be plain tool names or single-key maps with `allow`/`auto_approve` sublists. Absent = all tools enabled. |
+| `shell` | object | no | Shell execution policy (legacy; prefer inline tool policy). |
 
 ### Provider auth environment variables
 
@@ -77,18 +190,32 @@ The snapshot also persists:
   - `GITHUB_COPILOT_API_TOKEN` and optional `COPILOT_API_URL`, or
   - `COPILOT_TOKEN` (or `COPILOT_API_KEY`) and optional `COPILOT_API_URL`, or
   - `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN` (host exchanges it for a Copilot session token).
-| `labels` | string[] | no | Optional tags for discovery and filtering. |
-| `hooks` | array | no | Template-local hooks merged with repo/user hooks. See [HOOKS.md](HOOKS.md). |
-| `validate` | string | no | JavaScript validation function body run against the final assistant reply (`reply` arg). Must return truthy to accept. |
-| `max_validation_fails` | number | no | Maximum validation retries before failing. Absent = unlimited retries (still bounded by `max_steps`). |
-| `tools` | array | no | Tool allowlist for the session. Absent = all tools. |
-| `shell` | object | no | Shell execution policy. |
 
-## `metadata.shell` fields
+## `metadata.tools` format
+
+Tools may be listed as plain names or with inline policy:
+
+```yaml
+metadata:
+  tools:
+    - shell_execute:           # single-key map with policy
+        allow:                 # shell command allow-list (regex, default-deny if empty)
+          - '^openrgb($|\s)'
+          - '^govee($|\s)'
+        auto_approve:          # auto-approve without human review (subset of allow)
+          - '^openrgb($|\s)'
+          - '^govee($|\s)'
+    - fs__file__view           # plain name — tool enabled, no inline policy
+```
+
+- `allow`: ordered list of regex patterns matched against the full command string. First match wins. If empty/absent: all shell commands denied.
+- `auto_approve`: patterns for commands that execute without pausing for human approval. Must be a subset of `allow`.
+
+## `metadata.shell` fields (legacy)
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `allow` | array | no | Ordered list of regexp patterns matched against the full command string. First match wins. Absent (or empty) = all shell commands denied. |
+| `allow` | array | no | Merged with `metadata.tools.shell_execute.allow` (OR behavior). |
 | `timeout_secs` | number | no | Kill child processes after N seconds. Default: wait indefinitely. |
 
 ## `spec` fields
@@ -170,11 +297,11 @@ spec:
 
 ## Available tools
 
-### JavaScript sandbox
+### Shell emulator
 
 | Tool name | Description |
 |---|---|
-| `js_exec` | Execute JavaScript in the sandboxed Boa ES2020 interpreter. Globals: `console.log`, `fs.readFile(path)`, `fs.writeFile(path, content)`, `fs.readdir(dir)`, `require(path)`. Real host filesystem is NOT accessible. |
+| `shell_execute` | Execute a single shell command via the constrained host emulator. Input: `{"command":"..."}`. Built-ins: `echo`, `cat`, `ls`, `pwd`, `cd`. External commands spawn host processes subject to the template allow-list. See [SHELL.md](SHELL.md). |
 
 ### Virtual filesystem (tcow)
 
@@ -222,9 +349,7 @@ The model returns one of:
 {"type":"tool_call","tool":"fs__file__create","args":{"filePath":"out.txt","content":"hello"},"thought":"..."}
 {"type":"tool_call","tool":"fs__file__edit","args":{"filePath":"out.txt","oldString":"hello","newString":"world"},"thought":"..."}
 {"type":"tool_call","tool":"fs__directory__list","args":{"path":""},"thought":"..."}
-
-// js_exec — args.code or top-level code field both accepted
-{"type":"tool_call","tool":"js_exec","args":{"code":"console.log(1+1)"},"thought":"..."}
+{"type":"tool_call","tool":"shell_execute","args":{"command":"ls -la"},"thought":"..."}
 
 // Final answer
 {"type":"final","answer":"42","thought":"..."}
@@ -269,21 +394,17 @@ kind: Agent
 metadata:
   description: Shell agent
   model: xai:grok-4-fast-reasoning
-  # context_window is optional — omit for known xAI models (auto-detected).
-  # Set only for custom or unlisted models:
-  # context_window: 131072
   tools:
-    - js_exec
+    - shell_execute:
+        allow:
+          - '^git\s+(status|log|diff)\b'
+          - '^python3\b'
+        auto_approve:
+          - '^git\s+status\b'
     - fs__file__view
     - fs__file__create
     - fs__file__edit
     - fs__directory__list
-  shell:
-    allow:
-      - '^bash\b'
-      - '^python3\b'
-      - '^git\s+(status|log|diff)\b'
-    timeout_secs: 60
 spec:
   max_steps: 50
   system_prompt: |
@@ -362,84 +483,114 @@ The file is written after each loop tick and can be inspected or recovered at an
 
 ### Session file schema
 
-A session file has the same `apiVersion`/`kind` as the template it was created from. The `metadata` block is the template `metadata` merged with runtime fields, and `spec` gains a `messages` array:
+Session files share `apiVersion: daemon/v1` / `kind: Agent` with templates. The `metadata` block is the template `metadata` merged with runtime fields, and `spec` gains `messages`, `system_prompts`, `tools`, and hook fields:
 
 ```yaml
 apiVersion: daemon/v1
 kind: Agent
 metadata:
-  id: 1771208672042-143059-84e7
-  name: solo
-  model: xai:grok-4-fast-reasoning
-  tools: [js_exec]
+  id: 1774753727414-351661-aa06
+  name: desk-light-toggle
+  model: xai:grok-4-1-fast-reasoning
+  status: IDLE              # FSM state (see below)
+  cwd: /
+  workdir: /
+  created: '1774753727414'
+  last_pid: 351662
   labels: []
-  status: success           # FSM state (see below)
-  created: 2026-02-28T12:00:00.000Z
-  last_pid: 143059
-  lastTransition:
-    action: complete
-    from: running
-    to: success
-    timestamp: 2026-02-28T12:00:45.123Z
-  usage:
-    prompt_tokens: 4084
-    completion_tokens: 40
-    total_tokens: 4191
-    model: grok-4-1-fast-reasoning
-    timestamp: 2026-02-28T12:00:44.900Z
+  collaborators:
+    - desk-light-toggle
+    - toolshed
+  last_transition:
+    action: tool_call
+    from: IDLE
+    to: IDLE
+    timestamp: '1774753750928'
 spec:
-  system_prompt: |
-    You are a general-purpose assistant. ...
-  max_steps: null
+  system_prompts:
+    agent-desk-light-toggle-1774753727414-480c25: |
+      You are a desk-light automation assistant.
+    agent-toolshed-1774753727733-6e9b85: |
+      You are toolshed, a tool-recommendation specialist.
+  tools:
+    agent-desk-light-toggle-1774753727414-480c25:
+      - shell_execute:
+          allow:
+            - '^openrgb($|\s)'
+            - '^govee($|\s)'
+          auto_approve:
+            - '^openrgb($|\s)'
+            - '^govee($|\s)'
+    agent-toolshed-1774753727733-6e9b85:
+      - shell_execute:
+          allow:
+            - '^skills'
+          auto_approve:
+            - '^skills($|\s)'
   messages:
-    - role: user
-      content: "find and run the magic 8-ball program file"
-    - role: assistant
-      content: ""
-      tool_calls:
-        - id: call_75656196
-          type: function
-          function:
-            name: js_exec
-            arguments: '{"code":"require(\"fs\").readdir(\".\")"}'
-      finish_reason: tool_calls
-      timestamp: 2026-02-28T12:00:10.000Z
-    - role: tool
-      tool_call_id: call_75656196
-      name: js_exec
-      content: '{"stdout":"interesting_facts.txt,magic8ball.js","result":"undefined","error":null}'
-      timestamp: 2026-02-28T12:00:10.500Z
-    - role: assistant
-      content: "Found and ran `magic8ball.js` ..."
-      finish_reason: stop
-      timestamp: 2026-02-28T12:00:44.900Z
+    - id: event-1774753727414-69824d
+      role: user
+      verbatim:
+        content: "toggle desk light color (if red, make blue. if blue, make red)"
+        timestamp: '1774753727414'
+      meta:
+        visible: true
+        sent: false
+        origin: user
+        subscribers:
+          - agent-desk-light-toggle-1774753727414-480c25
+    - id: hook-1774753727416-4235d9
+      role: hook
+      verbatim:
+        hook_name: desk-light-cron-trigger
+        event: on_cron
+        executed: true
+        # ... (full hook audit record)
+      meta:
+        visible: true
+        sent: false
+        origin: hook
+    - id: event-1774753750927-50669f
+      role: assistant
+      verbatim:
+        content: ''
+        tool_calls:
+          - id: call_53929654
+            type: function
+            function:
+              name: shell_execute
+              arguments: '{"command":"openrgb --list-devices"}'
+      meta:
+        visible: true
+        kind: tool_call_batch
+        calls:
+          call_53929654:
+            sent: false
+            approval:
+              status: pending
+              reviewed_at: null
+              reason: null
+              modified_args: null
+        origin: llm
+        subscribers:
+          - agent-desk-light-toggle-1774753727414-480c25
+  hook_state:
+    last_event: filter_inf_res
+    last_timestamp: '1774753750927'
+    blocked: false
 ```
 
 ### FSM — session states
 
-```
-pending ──start──► running ──complete──► success
-                │          └──fail──────► error
-                ├──pause──► paused ──resume──► pending
-                └──stop───► stopped
-
-success ──retry──► pending
-error   ──retry──► pending
-stopped ──run────► running
-```
-
 | State | Meaning |
 |---|---|
-| `pending` | Created; waiting to start (or resumed from paused). |
-| `running` | Agent loop is active; awaiting LLM or tool response. |
-| `success` | LLM returned `finish_reason: stop`. Terminal unless retried. |
-| `error` | Unexpected error halted the loop. Terminal unless retried. |
-| `paused` | Paused by `SIGUSR1` or tool call; can be resumed. |
-| `stopped` | Stopped by `SIGUSR2` or explicit stop. Can be restarted. |
+| `IDLE` | Turn ended without final answer; waiting for next step (tool approval, resume, etc.) |
+| `SUCCESS` | LLM returned `finish_reason: stop`. Session complete. |
+| `FAIL` | Error or exhausted retry policy. |
 
 ### Session recovery
 
-On process startup, sessions in `running` state are detected and auto-resumed from the last persisted message. Sessions in `success` or `error` are left as-is unless explicitly retried.
+Sessions in `IDLE` state can be resumed at any time with `wasm1 -s <session_id>`. The runtime reads the session YAML, rebuilds state from `spec.messages`, and executes the next eligible step.
 
 ---
 

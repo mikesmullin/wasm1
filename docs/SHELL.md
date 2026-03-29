@@ -51,12 +51,12 @@ Shell policy is configured in templates and compiled by the host at load time.
 
 ### 3.1 Location and merge behavior
 
-Allow-list regexes come from both:
+Allow-list regexes come from:
 
-1. `metadata.shell.allow` (legacy/global shell policy)
-2. Inline tool policy under `metadata.tools` for `shell_execute`
+1. Inline tool policy under `metadata.tools` for `shell_execute` (preferred)
+2. `metadata.shell.allow` (legacy; still supported)
 
-Both sources are merged into one allow-list (`OR` behavior).
+Both sources are merged into one allow-list (`OR` behavior). Prefer inline tool policy for new templates.
 
 ### 3.2 Current preferred template style
 
@@ -226,6 +226,7 @@ Global CLI verbosity controls display style, not shell semantics:
 - default: final assistant response only
 - `-v`: user/assistant/tool event summary
 - `-vv`: full host/guest diagnostics
+- `-vvv`: hook execution trace (considered, executed, inputs/outputs per step)
 - `-q`: suppress stdout (errors still on stderr)
 
 These flags apply to normal runs. `exec` respects quiet mode by suppressing printed output when `-q` is set.
