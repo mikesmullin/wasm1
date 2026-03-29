@@ -233,6 +233,8 @@ struct HookFile {
 struct HookRunResult {
     blocked_reason: Option<String>,
     last_llm_output: Option<String>,
+    last_step_output: Option<String>,
+    events: Vec<HookEventRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,6 +301,10 @@ struct SessionMetadata {
     labels: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    participants: Vec<SessionParticipant>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    system_prompts: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_transition: Option<SessionTransition>,
 }
@@ -332,6 +338,10 @@ struct SessionMetadataIn {
     labels: Vec<String>,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    participants: Vec<SessionParticipant>,
+    #[serde(default)]
+    system_prompts: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -340,6 +350,10 @@ struct SessionSpecIn {
     system_prompt: Option<String>,
     #[serde(default)]
     messages: Vec<serde_json::Value>,
+    #[serde(default)]
+    hook_events: Vec<HookEventRecord>,
+    #[serde(default)]
+    hook_state: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -355,13 +369,45 @@ struct SessionSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     system_prompt: Option<String>,
     messages: Vec<SessionMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hook_events: Vec<HookEventRecord>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    hook_state: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionMessage {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    id: String,
     role: String,
     verbatim: serde_json::Value,
     meta: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SessionParticipant {
+    agent_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct HookEventRecord {
+    id: String,
+    event: String,
+    hook_name: String,
+    order: usize,
+    considered: bool,
+    executed: bool,
+    blocked: bool,
+    #[serde(default)]
+    step: u32,
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    input_verbatim: String,
+    #[serde(default)]
+    output_verbatim: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 // ── Shell output YAML ─────────────────────────────────────────────────────────
@@ -920,6 +966,16 @@ struct HostState {
     template_description: Option<String>,
     /// Template labels for session snapshots.
     template_labels: Vec<String>,
+    /// Active agent lane for context assembly and routing.
+    active_agent_id: String,
+    /// Collaborative participants persisted in session metadata.
+    participants: Vec<SessionParticipant>,
+    /// Agent-scoped system prompts persisted in session metadata.
+    system_prompts: HashMap<String, String>,
+    /// Append-only hook execution audit records.
+    hook_events: Vec<HookEventRecord>,
+    /// Hook workflow checkpoint state.
+    hook_state: serde_json::Value,
     /// Seeded history restored from session YAML on resume.
     seed_history: Vec<HistoryEntry>,
     /// Seeded validation feedback restored from session YAML on resume.
@@ -1706,6 +1762,11 @@ fn main() -> Result<()> {
     let mut seed_messages: Vec<SessionMessage> = Vec::new();
     let mut seed_pending_calls: Vec<PendingToolCall> = Vec::new();
     let mut seed_blocked_on_approval = false;
+    let mut session_participants: Vec<SessionParticipant> = Vec::new();
+    let mut session_system_prompts: HashMap<String, String> = HashMap::new();
+    let mut session_hook_events: Vec<HookEventRecord> = Vec::new();
+    let mut session_hook_state: serde_json::Value = serde_json::Value::Null;
+    let mut active_agent_id: Option<String> = None;
     let mut resume_model: Option<String> = None;
     let mut resume_prev_state: Option<String> = None;
     let (session_id, session_created, prompt, shell_cwd, shell_workdir) = if let Some(session_id) = session_name.clone() {
@@ -1714,6 +1775,13 @@ fn main() -> Result<()> {
             .join(format!("{session_id}.yaml"));
         let snapshot = load_session_seed(&session_path)?;
         let SessionSnapshotIn { metadata, spec } = snapshot;
+        session_participants = metadata.participants.clone();
+        session_system_prompts = metadata.system_prompts.clone();
+        session_hook_events = spec.hook_events.clone();
+        session_hook_state = spec.hook_state.clone();
+        if let Some(first) = session_participants.first() {
+            active_agent_id = Some(first.agent_id.clone());
+        }
         let resume_workdir = metadata
             .workdir
             .clone()
@@ -1734,6 +1802,22 @@ fn main() -> Result<()> {
         seed_blocked_on_approval = blocked_on_approval;
         if system_prompt.is_none() {
             system_prompt = spec.system_prompt;
+        }
+        if active_agent_id.is_none() {
+            active_agent_id = Some(make_agent_id(&metadata.name));
+        }
+        if session_participants.is_empty() {
+            session_participants.push(SessionParticipant {
+                agent_id: active_agent_id.clone().unwrap_or_else(|| make_agent_id("agent")),
+            });
+        }
+        if session_system_prompts.is_empty() {
+            if let Some(sys) = system_prompt.clone() {
+                session_system_prompts.insert(
+                    active_agent_id.clone().unwrap_or_else(|| make_agent_id("agent")),
+                    sys,
+                );
+            }
         }
         if !metadata.tools.is_empty() {
             enabled_tools = metadata.tools.clone();
@@ -1761,7 +1845,9 @@ fn main() -> Result<()> {
             // Do not keep the session parked behind prior pending approvals.
             seed_blocked_on_approval = false;
             seed_pending_calls.clear();
+            let lane_agent_id = active_agent_id.clone().unwrap_or_else(|| make_agent_id("agent"));
             seed_messages.push(SessionMessage {
+                id: scoped_id("event"),
                 role: "user".to_string(),
                 verbatim: serde_json::json!({
                     "content": new_prompt,
@@ -1770,6 +1856,8 @@ fn main() -> Result<()> {
                 meta: serde_json::json!({
                     "sent": false,
                     "visible": true,
+                    "origin": "user",
+                    "subscribers": [lane_agent_id],
                 }),
             });
             new_prompt
@@ -1800,6 +1888,25 @@ fn main() -> Result<()> {
             "/".to_string(),
         )
     };
+
+    if active_agent_id.is_none() {
+        active_agent_id = Some(make_agent_id(
+            template_name.as_deref().unwrap_or("agent"),
+        ));
+    }
+    if session_participants.is_empty() {
+        session_participants.push(SessionParticipant {
+            agent_id: active_agent_id.clone().unwrap_or_else(|| make_agent_id("agent")),
+        });
+    }
+    if session_system_prompts.is_empty() {
+        if let Some(sys) = system_prompt.clone() {
+            session_system_prompts.insert(
+                active_agent_id.clone().unwrap_or_else(|| make_agent_id("agent")),
+                sys,
+            );
+        }
+    }
 
     if !is_resume_mode {
         let stdin_text = if read_stdin { read_stdin_if_present()? } else { String::new() };
@@ -1863,6 +1970,8 @@ fn main() -> Result<()> {
                 max_steps,
                 labels: template_labels.clone(),
                 description: template_description.clone(),
+                participants: session_participants.clone(),
+                system_prompts: session_system_prompts.clone(),
                 last_transition: Some(SessionTransition {
                     action: "create".to_string(),
                     from: "IDLE".to_string(),
@@ -1873,6 +1982,8 @@ fn main() -> Result<()> {
             spec: SessionSpec {
                 system_prompt: system_prompt.clone(),
                 messages: Vec::new(),
+                hook_events: session_hook_events.clone(),
+                hook_state: session_hook_state.clone(),
             },
         };
         let yaml = serde_yaml::to_string(&snapshot).context("failed to serialize session snapshot")?;
@@ -2214,6 +2325,7 @@ fn main() -> Result<()> {
                 "user_message": req.prompt,
                 "last_inf_req": req.prompt,
                 "step": req.step,
+                "phase": "filter_inf_req",
             });
             match run_hooks_collect(
                 caller.data().hooks.as_slice(),
@@ -2225,6 +2337,19 @@ fn main() -> Result<()> {
                 caller.data().verbosity,
             ) {
                 Ok(run_result) => {
+                    if !run_result.events.is_empty() {
+                        caller
+                            .data_mut()
+                            .hook_events
+                            .extend(run_result.events.clone());
+                        let last = run_result.events.last().cloned();
+                        caller.data_mut().hook_state = serde_json::json!({
+                            "last_event": "filter_inf_req",
+                            "last_hook_id": last.as_ref().map(|e| e.id.clone()),
+                            "last_timestamp": now_stamp(),
+                            "blocked": run_result.blocked_reason.is_some(),
+                        });
+                    }
                     if let Some(reason) = run_result.blocked_reason {
                         let decision = LlmDecision::Error {
                             message: format!("blocked by hook filter_inf_req: {reason}"),
@@ -2285,18 +2410,21 @@ fn main() -> Result<()> {
                     "last_inf_res": assistant_msg_json,
                     "tool_calls": tool_calls,
                     "step": req.step,
+                    "phase": "filter_inf_res",
                 }),
                 LlmDecision::Final { answer, .. } => serde_json::json!({
                     "assistant_message": answer,
                     "last_inf_res": answer,
                     "termination_reason": "stop",
                     "step": req.step,
+                    "phase": "filter_inf_res",
                 }),
                 LlmDecision::Error { message, .. } => serde_json::json!({
                     "assistant_message": message,
                     "last_inf_res": message,
                     "termination_reason": "error",
                     "step": req.step,
+                    "phase": "filter_inf_res",
                 }),
             };
             if let Ok(Some(reason)) = run_hooks(caller.data_mut(), "filter_inf_res", &inf_res_payload, true) {
@@ -3047,6 +3175,11 @@ fn main() -> Result<()> {
         template_name: template_name.clone().unwrap_or_else(|| "solo".to_string()),
         template_description,
         template_labels,
+        active_agent_id: active_agent_id.unwrap_or_else(|| make_agent_id("agent")),
+        participants: session_participants,
+        system_prompts: session_system_prompts,
+        hook_events: session_hook_events,
+        hook_state: session_hook_state,
         seed_history,
         seed_validation_feedback,
         seed_step,
@@ -4115,7 +4248,7 @@ fn run_hooks(
     payload: &serde_json::Value,
     blocking: bool,
 ) -> Result<Option<String>> {
-    Ok(run_hooks_collect(
+    let run_result = run_hooks_collect(
         &state.hooks,
         &state.workspace_root,
         &state.session_id,
@@ -4123,8 +4256,18 @@ fn run_hooks(
         payload,
         blocking,
         state.verbosity,
-    )?
-    .blocked_reason)
+    )?;
+    if !run_result.events.is_empty() {
+        state.hook_events.extend(run_result.events.clone());
+        let last = run_result.events.last().cloned();
+        state.hook_state = serde_json::json!({
+            "last_event": event,
+            "last_hook_id": last.as_ref().map(|e| e.id.clone()),
+            "last_timestamp": now_stamp(),
+            "blocked": run_result.blocked_reason.is_some(),
+        });
+    }
+    Ok(run_result.blocked_reason)
 }
 
 fn hook_compact_json(value: &serde_json::Value, max_len: usize) -> String {
@@ -4143,6 +4286,21 @@ fn hook_compact_text(value: &str, max_len: usize) -> String {
         s.push_str("...");
     }
     s
+}
+
+fn hook_payload_step(payload: &serde_json::Value) -> u32 {
+    payload
+        .get("step")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32
+}
+
+fn hook_payload_phase(event: &str, payload: &serde_json::Value) -> String {
+    payload
+        .get("phase")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| event.to_string())
 }
 
 fn run_hooks_collect(
@@ -4165,6 +4323,8 @@ fn run_hooks_collect(
 
     let mut aggregated = HookRunResult::default();
     let mut order = 0usize;
+    let step = hook_payload_step(payload);
+    let phase = hook_payload_phase(event, payload);
 
     if verbosity.is_very_verbose() {
         println!(
@@ -4186,6 +4346,20 @@ fn run_hooks_collect(
                     hook.on
                 );
             }
+            aggregated.events.push(HookEventRecord {
+                id: scoped_id("hook"),
+                event: event.to_string(),
+                hook_name: hook.name.clone(),
+                order,
+                considered: false,
+                executed: false,
+                blocked: false,
+                step,
+                phase: phase.clone(),
+                input_verbatim: serde_json::to_string(&base).unwrap_or_default(),
+                output_verbatim: String::new(),
+                reason: Some("event_mismatch".to_string()),
+            });
             continue;
         }
         if !hook.enabled.unwrap_or(true) {
@@ -4196,6 +4370,20 @@ fn run_hooks_collect(
                     hook.name
                 );
             }
+            aggregated.events.push(HookEventRecord {
+                id: scoped_id("hook"),
+                event: event.to_string(),
+                hook_name: hook.name.clone(),
+                order,
+                considered: true,
+                executed: false,
+                blocked: false,
+                step,
+                phase: phase.clone(),
+                input_verbatim: serde_json::to_string(&base).unwrap_or_default(),
+                output_verbatim: String::new(),
+                reason: Some("disabled".to_string()),
+            });
             continue;
         }
         if !hook_matches(hook, &base) {
@@ -4206,6 +4394,20 @@ fn run_hooks_collect(
                     hook.name
                 );
             }
+            aggregated.events.push(HookEventRecord {
+                id: scoped_id("hook"),
+                event: event.to_string(),
+                hook_name: hook.name.clone(),
+                order,
+                considered: true,
+                executed: false,
+                blocked: false,
+                step,
+                phase: phase.clone(),
+                input_verbatim: serde_json::to_string(&base).unwrap_or_default(),
+                output_verbatim: String::new(),
+                reason: Some("when_mismatch".to_string()),
+            });
             continue;
         }
 
@@ -4229,17 +4431,20 @@ fn run_hooks_collect(
 
         match execute_hook_collect(hook, &base, workspace_root, verbosity) {
             Ok(run_result) => {
+                let last_llm_output = run_result.last_llm_output.clone();
+                let last_step_output = run_result.last_step_output.clone();
+                let blocked_reason = run_result.blocked_reason.clone();
                 if verbosity.is_very_verbose() {
                     println!(
                         "[HOOK] event={} hook={} done blocked={} has_llm_output={}",
                         event,
                         hook.name,
-                        run_result.blocked_reason.is_some(),
-                        run_result.last_llm_output.is_some(),
+                        blocked_reason.is_some(),
+                        last_llm_output.is_some(),
                     );
                 }
                 if verbosity.is_hook_trace() {
-                    if let Some(ref out) = run_result.last_llm_output {
+                    if let Some(ref out) = last_llm_output {
                         println!(
                             "[HOOK] event={} hook={} output.last_llm_output={}",
                             event,
@@ -4248,10 +4453,31 @@ fn run_hooks_collect(
                         );
                     }
                 }
-                if let Some(last) = run_result.last_llm_output {
+                if let Some(last) = last_llm_output.clone() {
                     aggregated.last_llm_output = Some(last);
                 }
-                if let Some(reason) = run_result.blocked_reason {
+                if let Some(last) = last_step_output.clone() {
+                    aggregated.last_step_output = Some(last.clone());
+                }
+                let blocked = blocked_reason.is_some();
+                let event_record = HookEventRecord {
+                    id: scoped_id("hook"),
+                    event: event.to_string(),
+                    hook_name: hook.name.clone(),
+                    order,
+                    considered: true,
+                    executed: true,
+                    blocked,
+                    step,
+                    phase: phase.clone(),
+                    input_verbatim: serde_json::to_string(&base).unwrap_or_default(),
+                    output_verbatim: last_step_output
+                        .or(last_llm_output)
+                        .unwrap_or_default(),
+                    reason: blocked_reason.clone(),
+                };
+                aggregated.events.push(event_record);
+                if let Some(reason) = blocked_reason {
                     if blocking {
                         aggregated.blocked_reason = Some(reason);
                         return Ok(aggregated);
@@ -4259,6 +4485,20 @@ fn run_hooks_collect(
                 }
             }
             Err(err) => {
+                aggregated.events.push(HookEventRecord {
+                    id: scoped_id("hook"),
+                    event: event.to_string(),
+                    hook_name: hook.name.clone(),
+                    order,
+                    considered: true,
+                    executed: true,
+                    blocked: true,
+                    step,
+                    phase: phase.clone(),
+                    input_verbatim: serde_json::to_string(&base).unwrap_or_default(),
+                    output_verbatim: String::new(),
+                    reason: Some(err.to_string()),
+                });
                 if blocking {
                     aggregated.blocked_reason = Some(format!("hook '{}' failed: {err}", hook.name));
                     return Ok(aggregated);
@@ -4312,6 +4552,7 @@ fn execute_hook_collect(
     let mut completed: HashMap<String, ()> = HashMap::new();
     let mut outputs: HashMap<String, String> = HashMap::new();
     let mut last_llm_output: Option<String> = None;
+    let mut last_step_output: Option<String> = None;
 
     while completed.len() < hook.jobs.len() {
         let mut progressed = false;
@@ -4345,6 +4586,7 @@ fn execute_hook_collect(
                 }
                 let step_out = execute_hook_step(step, payload, &outputs, workspace_root)
                     .with_context(|| format!("job={job_name} step={}", step.id.clone().unwrap_or_else(|| idx.to_string())))?;
+                last_step_output = Some(step_out.clone());
                 if verbosity.is_hook_trace() {
                     println!(
                         "[HOOK] hook={} job={} step={} output={}",
@@ -4363,6 +4605,8 @@ fn execute_hook_collect(
                     return Ok(HookRunResult {
                         blocked_reason: Some(reason),
                         last_llm_output,
+                        last_step_output,
+                        events: Vec::new(),
                     });
                 }
                 if step.step_type == "llm" {
@@ -4381,6 +4625,8 @@ fn execute_hook_collect(
     Ok(HookRunResult {
         blocked_reason: None,
         last_llm_output,
+        last_step_output,
+        events: Vec::new(),
     })
 }
 
@@ -4423,22 +4669,103 @@ fn execute_hook_step(
                 return Err(anyhow!("llm step requires template and prompt"));
             }
             let exe = env::current_exe().context("cannot resolve current executable")?;
-            let mut cmd = Command::new(exe);
-            cmd.arg("-t").arg(template).arg(prompt).current_dir(workspace_root);
-            let out = cmd.output().context("failed to run nested llm hook step")?;
-            if !out.status.success() {
+            let max_resume_steps = step
+                .data
+                .get("max_resume_steps")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(8) as usize;
+
+            let mut history_dump = String::new();
+            let mut nested_session_id: Option<String> = None;
+
+            let first_out = Command::new(&exe)
+                .arg("-vv")
+                .arg("-t")
+                .arg(&template)
+                .arg(&prompt)
+                .current_dir(workspace_root)
+                .output()
+                .context("failed to run nested llm hook step")?;
+            if !first_out.status.success() {
                 return Err(anyhow!("nested llm hook failed"));
             }
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            for line in stdout.lines().rev() {
-                if let Some(rest) = line.strip_prefix("[HOST] Agent loop complete. Final answer: ") {
-                    return Ok(rest.to_string());
+            let first_stdout = String::from_utf8_lossy(&first_out.stdout).to_string();
+            if !history_dump.is_empty() {
+                history_dump.push('\n');
+            }
+            history_dump.push_str(&first_stdout);
+            if let Some(final_answer) = extract_nested_final_answer(&first_stdout) {
+                return Ok(final_answer);
+            }
+            if let Some((sid, status)) = extract_nested_session_summary(&first_stdout) {
+                nested_session_id = Some(sid);
+                if status == "SUCCESS" || status == "FAIL" {
+                    return Ok(first_stdout.trim().to_string());
                 }
             }
-            Ok(stdout.trim().to_string())
+
+            let session_id = nested_session_id.ok_or_else(|| {
+                anyhow!(
+                    "nested llm hook did not expose session id; run with -vv in nested path"
+                )
+            })?;
+
+            for _ in 0..max_resume_steps {
+                let out = Command::new(&exe)
+                    .arg("-vv")
+                    .arg("-s")
+                    .arg(&session_id)
+                    .current_dir(workspace_root)
+                    .output()
+                    .context("failed to resume nested llm hook session")?;
+                if !out.status.success() {
+                    return Err(anyhow!("nested llm hook resume failed"));
+                }
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                if !history_dump.is_empty() {
+                    history_dump.push('\n');
+                }
+                history_dump.push_str(&stdout);
+                if let Some(final_answer) = extract_nested_final_answer(&stdout) {
+                    return Ok(final_answer);
+                }
+                if let Some((_, status)) = extract_nested_session_summary(&stdout) {
+                    if status == "SUCCESS" || status == "FAIL" {
+                        break;
+                    }
+                }
+            }
+
+            Ok(history_dump.trim().to_string())
         }
         other => Err(anyhow!("unsupported hook step type: {other}")),
     }
+}
+
+fn extract_nested_final_answer(stdout: &str) -> Option<String> {
+    for line in stdout.lines().rev() {
+        if let Some(rest) = line.strip_prefix("[HOST] Agent loop complete. Final answer: ") {
+            return Some(rest.trim().to_string());
+        }
+        if let Some(rest) = line.strip_prefix("assistant: ") {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+fn extract_nested_session_summary(stdout: &str) -> Option<(String, String)> {
+    let re = Regex::new(r"^([^\s]+)\s+(IDLE|RUNNING|SUCCESS|FAIL)\s+\.agent/sessions/[^\s]+\.yaml$").ok()?;
+    for line in stdout.lines().rev() {
+        let caps = match re.captures(line.trim()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let sid = caps.get(1).map(|m| m.as_str().to_string())?;
+        let status = caps.get(2).map(|m| m.as_str().to_string())?;
+        return Some((sid, status));
+    }
+    None
 }
 
 fn render_expr_template(input: &str, payload: &serde_json::Value, outputs: &HashMap<String, String>) -> Result<String> {
@@ -4610,19 +4937,63 @@ fn normalize_session_messages(messages: &[serde_json::Value]) -> Vec<SessionMess
     messages
         .iter()
         .map(|msg| {
+            let id = msg
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| scoped_id("event"));
             let role = msg
                 .get("role")
                 .and_then(|v| v.as_str())
                 .unwrap_or("assistant")
                 .to_string();
             let verbatim = message_verbatim(msg);
-            let meta = msg
+            let mut meta = msg
                 .get("meta")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({"visible": true, "sent": true}));
-            SessionMessage { role, verbatim, meta }
+            if meta.get("visible").is_none() {
+                meta["visible"] = serde_json::json!(true);
+            }
+            if meta.get("sent").is_none() {
+                meta["sent"] = serde_json::json!(true);
+            }
+            SessionMessage { id, role, verbatim, meta }
         })
         .collect()
+}
+
+fn message_subscribers(msg: &SessionMessage) -> Option<Vec<String>> {
+    let list = msg
+        .meta
+        .get("subscribers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if list.is_empty() {
+        None
+    } else {
+        Some(list)
+    }
+}
+
+fn message_visible_to_agent(msg: &SessionMessage, agent_id: &str) -> bool {
+    if !msg
+        .meta
+        .get("visible")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    match message_subscribers(msg) {
+        Some(subs) => subs.iter().any(|s| s == agent_id),
+        None => true,
+    }
 }
 
 fn message_text_content(msg: &serde_json::Value) -> String {
@@ -4873,7 +5244,12 @@ fn load_session_seed(path: &Path) -> Result<SessionSnapshotIn> {
     Ok(snapshot)
 }
 
-fn build_session_messages(req: Option<&GuestRequest>, decision: Option<&LlmDecision>, auto_rules: &[AutoApproveRule]) -> Vec<SessionMessage> {
+fn build_session_messages(
+    req: Option<&GuestRequest>,
+    decision: Option<&LlmDecision>,
+    auto_rules: &[AutoApproveRule],
+    active_agent_id: &str,
+) -> Vec<SessionMessage> {
     let mut messages: Vec<SessionMessage> = Vec::new();
     let mut unsent_tool_result_ids: HashSet<String> = HashSet::new();
     if let Some(req) = req {
@@ -4884,6 +5260,7 @@ fn build_session_messages(req: Option<&GuestRequest>, decision: Option<&LlmDecis
     if let Some(req) = req {
         if !req.prompt.is_empty() {
             messages.push(SessionMessage {
+                id: scoped_id("event"),
                 role: "user".to_string(),
                 verbatim: serde_json::json!({
                     "content": req.prompt,
@@ -4892,6 +5269,8 @@ fn build_session_messages(req: Option<&GuestRequest>, decision: Option<&LlmDecis
                 meta: serde_json::json!({
                     "visible": true,
                     "sent": true,
+                    "origin": "user",
+                    "subscribers": [active_agent_id],
                 }),
             });
         }
@@ -4930,16 +5309,20 @@ fn build_session_messages(req: Option<&GuestRequest>, decision: Option<&LlmDecis
                     }
                 }
                 messages.push(SessionMessage {
+                    id: scoped_id("event"),
                     role: "assistant".to_string(),
                     verbatim: assistant_payload,
                     meta: serde_json::json!({
                         "kind": "tool_call_batch",
                         "visible": true,
                         "calls": calls_meta,
+                        "origin": "llm",
+                        "subscribers": [active_agent_id],
                     }),
                 });
             }
             messages.push(SessionMessage {
+                id: scoped_id("event"),
                 role: "tool".to_string(),
                 verbatim: serde_json::json!({
                     "tool_call_id": entry.tool_call_id,
@@ -4961,6 +5344,8 @@ fn build_session_messages(req: Option<&GuestRequest>, decision: Option<&LlmDecis
                     "kind": "tool_result",
                     "visible": true,
                     "sent": sent,
+                    "origin": "tool",
+                    "subscribers": [active_agent_id],
                     "approval": {
                         "status": status,
                         "reviewed_at": null,
@@ -4977,6 +5362,7 @@ fn build_session_messages(req: Option<&GuestRequest>, decision: Option<&LlmDecis
                 continue;
             }
             messages.push(SessionMessage {
+                id: scoped_id("event"),
                 role: "user".to_string(),
                 verbatim: serde_json::json!({
                     "content": feedback,
@@ -4985,6 +5371,8 @@ fn build_session_messages(req: Option<&GuestRequest>, decision: Option<&LlmDecis
                 meta: serde_json::json!({
                     "visible": true,
                     "sent": true,
+                    "origin": "validation",
+                    "subscribers": [active_agent_id],
                 }),
             });
         }
@@ -5018,11 +5406,14 @@ fn build_session_messages(req: Option<&GuestRequest>, decision: Option<&LlmDecis
                     "kind": "tool_call_batch",
                     "visible": true,
                     "calls": calls_meta,
+                    "origin": "llm",
+                    "subscribers": [active_agent_id],
                 });
                 if let Some(perf_val) = perf {
                     assistant_meta["perf"] = perf_val.clone();
                 }
                 messages.push(SessionMessage {
+                    id: scoped_id("event"),
                     role: "assistant".to_string(),
                     verbatim: assistant_payload,
                     meta: assistant_meta,
@@ -5032,11 +5423,14 @@ fn build_session_messages(req: Option<&GuestRequest>, decision: Option<&LlmDecis
                 let mut assistant_meta = serde_json::json!({
                     "visible": true,
                     "sent": true,
+                    "origin": "llm",
+                    "subscribers": [active_agent_id],
                 });
                 if let Some(perf_val) = perf {
                     assistant_meta["perf"] = perf_val.clone();
                 }
                 messages.push(SessionMessage {
+                    id: scoped_id("event"),
                     role: "assistant".to_string(),
                     verbatim: serde_json::json!({
                         "content": answer,
@@ -5051,11 +5445,14 @@ fn build_session_messages(req: Option<&GuestRequest>, decision: Option<&LlmDecis
                 let mut assistant_meta = serde_json::json!({
                     "visible": true,
                     "sent": true,
+                    "origin": "llm",
+                    "subscribers": [active_agent_id],
                 });
                 if let Some(perf_val) = perf {
                     assistant_meta["perf"] = perf_val.clone();
                 }
                 messages.push(SessionMessage {
+                    id: scoped_id("event"),
                     role: "assistant".to_string(),
                     verbatim: serde_json::json!({
                         "content": format!("ERROR: {message}"),
@@ -5083,21 +5480,36 @@ fn write_session_snapshot(
     let messages = if let Some(req) = req {
         // Rebuild from authoritative guest request state so checkpointed tool
         // results and updated history are not dropped during resume cycles.
-        let mut rebuilt = build_session_messages(Some(req), None, &state.auto_approve_rules);
+        let mut rebuilt = build_session_messages(
+            Some(req),
+            None,
+            &state.auto_approve_rules,
+            &state.active_agent_id,
+        );
         if let Some(dec) = decision {
-            rebuilt.extend(build_session_messages(None, Some(dec), &state.auto_approve_rules));
+            rebuilt.extend(build_session_messages(
+                None,
+                Some(dec),
+                &state.auto_approve_rules,
+                &state.active_agent_id,
+            ));
         }
         state.seed_messages = rebuilt.clone();
         rebuilt
     } else if !state.seed_messages.is_empty() {
         let mut merged = state.seed_messages.clone();
         if let Some(dec) = decision {
-            merged.extend(build_session_messages(None, Some(dec), &state.auto_approve_rules));
+            merged.extend(build_session_messages(
+                None,
+                Some(dec),
+                &state.auto_approve_rules,
+                &state.active_agent_id,
+            ));
         }
         state.seed_messages = merged.clone();
         merged
     } else {
-        let built = build_session_messages(req, decision, &state.auto_approve_rules);
+        let built = build_session_messages(req, decision, &state.auto_approve_rules, &state.active_agent_id);
         state.seed_messages = built.clone();
         built
     };
@@ -5117,6 +5529,8 @@ fn write_session_snapshot(
             max_steps: state.max_steps,
             labels: state.template_labels.clone(),
             description: state.template_description.clone(),
+            participants: state.participants.clone(),
+            system_prompts: state.system_prompts.clone(),
             last_transition: Some(SessionTransition {
                 action: action.to_string(),
                 from,
@@ -5127,6 +5541,8 @@ fn write_session_snapshot(
         spec: SessionSpec {
             system_prompt: state.system_prompt.clone(),
             messages,
+            hook_events: state.hook_events.clone(),
+            hook_state: state.hook_state.clone(),
         },
     };
     let yaml = serde_yaml::to_string(&snapshot).context("failed to serialize session snapshot")?;
@@ -5183,7 +5599,33 @@ fn msg_id(prefix: &str) -> String {
     h.update(seed.as_bytes());
     let digest = h.finalize();
     let suffix = format!("{:02x}{:02x}{:02x}", digest[0], digest[1], digest[2]);
-    format!("{prefix}-{ts}-{seq:04x}-{suffix}")
+    format!("{prefix}-{ts}-{suffix}")
+}
+
+fn scoped_id(kind: &str) -> String {
+    let ts = now_millis();
+    let seq = MSG_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    let seed = format!("{}-{}-{}-{}", kind, ts, std::process::id(), seq);
+    let mut h = Sha1::new();
+    h.update(seed.as_bytes());
+    let digest = h.finalize();
+    let suffix = format!("{:02x}{:02x}{:02x}", digest[0], digest[1], digest[2]);
+    format!("{kind}-{ts}-{suffix}")
+}
+
+fn make_agent_id(agent_name: &str) -> String {
+    let safe_name = agent_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_ascii_lowercase();
+    let kind = if safe_name.is_empty() {
+        "agent".to_string()
+    } else {
+        format!("agent-{safe_name}")
+    };
+    scoped_id(&kind)
 }
 
 fn priority_rank(priority: &str) -> i32 {
@@ -5809,19 +6251,20 @@ fn auto_approve_match_text(call: &ToolInvocation) -> String {
     call.args.to_string()
 }
 
-fn build_llm_messages_from_seed(state: &HostState) -> Vec<serde_json::Value> {
+fn build_context_for_agent(state: &HostState, agent_id: &str) -> Vec<serde_json::Value> {
+    let system_prompt = state
+        .system_prompts
+        .get(agent_id)
+        .map(String::as_str)
+        .or_else(|| state.system_prompt.as_deref())
+        .unwrap_or("");
     let mut messages: Vec<serde_json::Value> = vec![serde_json::json!({
         "role": "system",
-        "content": state.system_prompt.as_deref().unwrap_or(""),
+        "content": system_prompt,
     })];
 
     for msg in &state.seed_messages {
-        let visible = msg
-            .meta
-            .get("visible")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        if !visible {
+        if !message_visible_to_agent(msg, agent_id) {
             continue;
         }
         match msg.role.as_str() {
@@ -5943,7 +6386,7 @@ fn llm_decide(state: &HostState, req: &GuestRequest) -> Result<LlmDecision> {
     // For resumed sessions, preserve exact YAML ordering and role alternation.
     // For brand-new sessions, keep legacy seed behavior.
     let messages: Vec<serde_json::Value> = if !state.seed_messages.is_empty() {
-        build_llm_messages_from_seed(state)
+        build_context_for_agent(state, &state.active_agent_id)
     } else {
         let system = state.system_prompt.as_deref().unwrap_or("");
         let initial_user = &req.prompt;

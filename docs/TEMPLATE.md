@@ -25,6 +25,43 @@ spec:
 | `metadata` | object | yes | Runtime + behavior config. |
 | `spec` | object | yes | Prompt and execution-facing data. |
 
+## Session Snapshot Schema (Collaborative Runtime)
+
+`wasm1` persists session snapshots under `.agent/sessions/<session_id>.yaml`.
+The runtime now supports collaborative lanes inside one session timeline.
+
+### Metadata additions
+
+| Field | Type | Notes |
+|---|---|---|
+| `metadata.participants` | array | Participating agents for this session. Each item has `agent_id`. |
+| `metadata.system_prompts` | map | Per-agent system prompt map keyed by `agent_id`. |
+
+### Message model
+
+Each timeline entry in `spec.messages[]` stores:
+
+- `id`: stable event id (`event-<ts>-<short_hash>`)
+- `role`: provider-facing role (`user`, `assistant`, `tool`, ...)
+- `verbatim`: provider-safe payload fields
+- `meta`: local orchestration/audit fields
+
+Common `meta` fields:
+
+- `visible`: global operator visibility gate
+- `sent`: provider inclusion gate for approval flow
+- `subscribers`: list of `agent_id` values that should receive this item in context assembly
+- `origin`: source of the event (`user`, `llm`, `tool`, `hook`, ...)
+
+### Hook observability + checkpointing
+
+The snapshot also persists:
+
+- `spec.hook_events`: append-only hook execution audit records, including input/output verbatim
+- `spec.hook_state`: resumable checkpoint metadata for hook workflow progress
+
+`hook_events` items include: `id`, `event`, `hook_name`, `order`, `considered`, `executed`, `blocked`, `step`, `phase`, `input_verbatim`, `output_verbatim`, and optional `reason`.
+
 ## `metadata` fields
 
 | Field | Type | Required | Notes |

@@ -4,6 +4,19 @@
 **Date:** 2026-03-15  
 **Status:** Draft – awaiting review before implementation begins
 
+## Implemented Runtime Notes (2026-03)
+
+The current runtime now persists collaborative state in each session snapshot:
+
+- `metadata.participants[]` with `agent_id`
+- `metadata.system_prompts[agent_id]`
+- `spec.messages[]` with `id`, `verbatim`, and local `meta`
+- `meta.subscribers[]` routing + `meta.visible` gating for context assembly
+- `spec.hook_events[]` append-only execution audit
+- `spec.hook_state` resumable checkpoint marker
+
+Hook `llm` steps now resume nested sessions stepwise until terminal state (or configured resume cap) instead of a one-shot nested call assumption.
+
 ---
 
 ## Problem Statement

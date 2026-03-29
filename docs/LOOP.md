@@ -59,6 +59,8 @@ the LLM may only receive a subset/summary of that on each turn--after it exceeds
 
 These callback functions provide an opportunity to automatically mutate state via modular architecture. We call this the lifecycle.
 
+Session/template YAML schema details are documented in [TEMPLATE.md](TEMPLATE.md).
+
 - `on_cron`: (optional) scheduled trigger. used to create new session from a predetermined user prompt.
 - `on_session_start`: new session creation. can mutate system prompt, before LLM sees it.
 - `on_turn_start`: loop iteration. triggered even if there is nothing to be done (ie. may be pending user request, or tool call response, etc.)
