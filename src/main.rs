@@ -26,6 +26,33 @@ const SHELL_TIMEOUT_DEFAULT: Option<u64> = None;
 static MSG_ID_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verbosity {
+    Quiet,
+    Default,
+    Verbose,
+    VeryVerbose,
+    HookTrace,
+}
+
+impl Verbosity {
+    fn is_quiet(self) -> bool {
+        matches!(self, Verbosity::Quiet)
+    }
+
+    fn is_verbose(self) -> bool {
+        matches!(self, Verbosity::Verbose | Verbosity::VeryVerbose | Verbosity::HookTrace)
+    }
+
+    fn is_very_verbose(self) -> bool {
+        matches!(self, Verbosity::VeryVerbose | Verbosity::HookTrace)
+    }
+
+    fn is_hook_trace(self) -> bool {
+        matches!(self, Verbosity::HookTrace)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelProvider {
     Xai,
     Copilot,
@@ -55,7 +82,7 @@ struct TemplateMetadata {
     shell: Option<ShellConfig>,
     auto_approve: Option<Vec<AutoApproveRuleDef>>,
     /// Explicit tool allowlist for the session. Absent = all tools.
-    tools: Option<Vec<String>>,
+    tools: Option<Vec<serde_yaml::Value>>,
     /// If true, disable SSL certificate validation for HTTP requests.
     ignore_ssl: Option<bool>,
 }
@@ -71,12 +98,89 @@ struct AutoApproveRuleDef {
     tool: String,
     #[serde(default)]
     pattern: Option<String>,
+    #[serde(default)]
+    patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 struct AutoApproveRule {
     tool: String,
     pattern: Option<Regex>,
+}
+
+fn parse_template_tools(
+    tools_field: Option<&Vec<serde_yaml::Value>>,
+) -> Result<(Vec<String>, Vec<AutoApproveRuleDef>, Vec<String>)> {
+    let Some(entries) = tools_field else {
+        return Ok((all_tool_names(), Vec::new(), Vec::new()));
+    };
+
+    let mut tools: Vec<String> = Vec::new();
+    let mut inline_rules: Vec<AutoApproveRuleDef> = Vec::new();
+    let mut inline_allow: Vec<String> = Vec::new();
+
+    for entry in entries {
+        if let Some(name) = entry.as_str() {
+            if !name.trim().is_empty() {
+                tools.push(name.to_string());
+            }
+            continue;
+        }
+
+        let map = entry
+            .as_mapping()
+            .ok_or_else(|| anyhow!("invalid tools entry: expected string or single-key mapping"))?;
+        if map.len() != 1 {
+            return Err(anyhow!("invalid tools mapping entry: expected exactly one key"));
+        }
+        let (k, v) = map.iter().next().ok_or_else(|| anyhow!("empty tools mapping entry"))?;
+        let tool_name = k
+            .as_str()
+            .ok_or_else(|| anyhow!("invalid tools mapping key: expected string"))?
+            .to_string();
+        tools.push(tool_name.clone());
+
+        if v.is_null() {
+            continue;
+        }
+        let cfg = v
+            .as_mapping()
+            .ok_or_else(|| anyhow!("invalid tools config for '{tool_name}': expected mapping"))?;
+        if let Some(allow_val) = cfg.get(&serde_yaml::Value::String("allow".to_string())) {
+            let seq = allow_val.as_sequence().ok_or_else(|| {
+                anyhow!("invalid tools.{tool_name}.allow: expected list of regex strings")
+            })?;
+            for item in seq {
+                let pat = item.as_str().ok_or_else(|| {
+                    anyhow!("invalid tools.{tool_name}.allow entry: expected string")
+                })?;
+                inline_allow.push(pat.to_string());
+            }
+        }
+        if let Some(auto_val) = cfg.get(&serde_yaml::Value::String("auto_approve".to_string())) {
+            let seq = auto_val.as_sequence().ok_or_else(|| {
+                anyhow!("invalid tools.{tool_name}.auto_approve: expected list of regex strings")
+            })?;
+            let mut patterns: Vec<String> = Vec::new();
+            for item in seq {
+                let pat = item.as_str().ok_or_else(|| {
+                    anyhow!("invalid tools.{tool_name}.auto_approve entry: expected string")
+                })?;
+                patterns.push(pat.to_string());
+            }
+            inline_rules.push(AutoApproveRuleDef {
+                tool: tool_name,
+                pattern: None,
+                patterns,
+            });
+        }
+    }
+
+    if tools.is_empty() {
+        Ok((all_tool_names(), inline_rules, inline_allow))
+    } else {
+        Ok((tools, inline_rules, inline_allow))
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -185,6 +289,8 @@ struct SessionMetadata {
     name: String,
     model: String,
     status: String,
+    cwd: String,
+    workdir: String,
     created: String,
     last_pid: u32,
     tools: Vec<String>,
@@ -214,6 +320,10 @@ struct SessionMetadataIn {
     created: Option<String>,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    workdir: Option<String>,
     #[serde(default)]
     state: Option<String>,
     #[serde(default)]
@@ -270,6 +380,486 @@ struct ShellOut {
     timeout_secs: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+struct ParsedShellCommand {
+    program: String,
+    args: Vec<String>,
+    redirect_out: Option<String>,
+}
+
+enum ShellParseError {
+    Unsupported(String),
+    Invalid(String),
+}
+
+fn shell_policy_error(message: &str) -> String {
+    format!("Policy Error: {message}")
+}
+
+fn normalize_vfs_path(path: &str) -> String {
+    path.trim()
+        .trim_start_matches('/')
+        .trim_start_matches("./")
+        .to_string()
+}
+
+fn canonicalize_shell_path(cwd: &str, input: &str) -> String {
+    let input = input.trim();
+    let mut parts: Vec<String> = Vec::new();
+
+    if !input.starts_with('/') {
+        for p in cwd.trim_start_matches('/').split('/') {
+            if !p.is_empty() {
+                parts.push(p.to_string());
+            }
+        }
+    }
+
+    for p in input.split('/') {
+        match p {
+            "" | "." => {}
+            ".." => {
+                let _ = parts.pop();
+            }
+            _ => parts.push(p.to_string()),
+        }
+    }
+
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
+}
+
+fn abs_to_rel(abs: &str) -> String {
+    abs.trim_start_matches('/').to_string()
+}
+
+fn wildcard_pattern_to_rel(cwd: &str, pattern: &str) -> String {
+    if pattern.starts_with('/') {
+        return pattern.trim_start_matches('/').to_string();
+    }
+    let base = abs_to_rel(cwd);
+    if base.is_empty() {
+        pattern.to_string()
+    } else if pattern.is_empty() {
+        base
+    } else {
+        format!("{base}/{pattern}")
+    }
+}
+
+fn list_dir_entries(tcow_path: &str, pending_writes: &[(String, Vec<u8>)], dir_abs: &str) -> Vec<String> {
+    let dir_rel = abs_to_rel(dir_abs);
+    let prefix = if dir_rel.is_empty() {
+        String::new()
+    } else {
+        format!("{dir_rel}/")
+    };
+    let mut uniq: HashSet<String> = HashSet::new();
+    for p in list_union_paths(tcow_path, pending_writes) {
+        if prefix.is_empty() {
+            if !p.is_empty() {
+                uniq.insert(p.split('/').next().unwrap_or("" ).to_string());
+            }
+        } else if p.starts_with(&prefix) {
+            let rest = &p[prefix.len()..];
+            if !rest.is_empty() {
+                uniq.insert(rest.split('/').next().unwrap_or(rest).to_string());
+            }
+        }
+    }
+    let mut out: Vec<String> = uniq.into_iter().filter(|s| !s.is_empty()).collect();
+    out.sort();
+    out
+}
+
+fn directory_exists(tcow_path: &str, pending_writes: &[(String, Vec<u8>)], dir_abs: &str) -> bool {
+    if dir_abs == "/" {
+        return true;
+    }
+    let dir_rel = abs_to_rel(dir_abs);
+    let prefix = format!("{dir_rel}/");
+    list_union_paths(tcow_path, pending_writes)
+        .into_iter()
+        .any(|p| p.starts_with(&prefix))
+}
+
+fn parse_shell_command(input: &str) -> Result<ParsedShellCommand, ShellParseError> {
+    let sanitized = input.replace(';', " ");
+    let s = sanitized.trim();
+    if s.is_empty() {
+        return Err(ShellParseError::Invalid("empty command".to_string()));
+    }
+    if s.contains("$(") {
+        return Err(ShellParseError::Unsupported(shell_policy_error(
+            "shell emulator does not support subshell syntax $().",
+        )));
+    }
+    if s.contains("&&") {
+        return Err(ShellParseError::Unsupported(shell_policy_error(
+            "shell emulator does not support logical operators like &&.",
+        )));
+    }
+    if s.contains('|') {
+        return Err(ShellParseError::Unsupported(shell_policy_error(
+            "shell emulator does not support pipes. Use a single simple command with optional quoting and optional '>' output redirection.",
+        )));
+    }
+    if s.contains("<<") {
+        return Err(ShellParseError::Unsupported(shell_policy_error(
+            "shell emulator does not support heredoc syntax.",
+        )));
+    }
+    if s.contains(">>") {
+        return Err(ShellParseError::Unsupported(shell_policy_error(
+            "shell emulator does not support append redirection >>.",
+        )));
+    }
+    if s.contains('`') {
+        return Err(ShellParseError::Unsupported(shell_policy_error(
+            "shell emulator does not support backtick command substitution.",
+        )));
+    }
+    if Regex::new(r"(^|\s)export\s+[A-Za-z_]")
+        .ok()
+        .map(|re| re.is_match(s))
+        .unwrap_or(false)
+    {
+        return Err(ShellParseError::Unsupported(shell_policy_error(
+            "shell emulator does not support export variable assignment.",
+        )));
+    }
+    if Regex::new(r"\$[A-Za-z_][A-Za-z0-9_]*")
+        .ok()
+        .map(|re| re.is_match(s))
+        .unwrap_or(false)
+    {
+        return Err(ShellParseError::Unsupported(shell_policy_error(
+            "shell emulator does not support variable substitution like $VAR.",
+        )));
+    }
+    if Regex::new(r"(^|\s)&(\s|$)")
+        .ok()
+        .map(|re| re.is_match(s))
+        .unwrap_or(false)
+    {
+        return Err(ShellParseError::Unsupported(shell_policy_error(
+            "shell emulator does not support background execution with &.",
+        )));
+    }
+
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaping = false;
+    for ch in s.chars() {
+        if escaping {
+            current.push(ch);
+            escaping = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escaping = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if !in_single && !in_double {
+            if ch == '>' {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+                tokens.push(">".to_string());
+                continue;
+            }
+            if ch.is_whitespace() {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+                continue;
+            }
+        }
+        current.push(ch);
+    }
+    if escaping || in_single || in_double {
+        return Err(ShellParseError::Invalid("unterminated escape or quote".to_string()));
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    if tokens.is_empty() {
+        return Err(ShellParseError::Invalid("empty command".to_string()));
+    }
+
+    let mut redirect_out: Option<String> = None;
+    let mut core: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if tokens[i] == ">" {
+            if redirect_out.is_some() {
+                return Err(ShellParseError::Invalid("multiple output redirections are not supported".to_string()));
+            }
+            if i + 1 >= tokens.len() {
+                return Err(ShellParseError::Invalid("missing redirection target after '>'".to_string()));
+            }
+            redirect_out = Some(tokens[i + 1].clone());
+            if i + 2 != tokens.len() {
+                return Err(ShellParseError::Invalid("only one command with a single trailing '>' redirection is supported".to_string()));
+            }
+            break;
+        }
+        core.push(tokens[i].clone());
+        i += 1;
+    }
+
+    if core.is_empty() {
+        return Err(ShellParseError::Invalid("missing command before redirection".to_string()));
+    }
+    let program = core[0].clone();
+    let args = core[1..].to_vec();
+    Ok(ParsedShellCommand {
+        program,
+        args,
+        redirect_out,
+    })
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let mut rx = String::from("^");
+    for ch in pattern.chars() {
+        match ch {
+            '*' => rx.push_str(".*"),
+            '?' => rx.push('.'),
+            '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+                rx.push('\\');
+                rx.push(ch);
+            }
+            _ => rx.push(ch),
+        }
+    }
+    rx.push('$');
+    Regex::new(&rx).map(|re| re.is_match(text)).unwrap_or(false)
+}
+
+fn list_union_paths(tcow_path: &str, pending_writes: &[(String, Vec<u8>)]) -> Vec<String> {
+    let mut set: HashSet<String> = HashSet::new();
+    if Path::new(tcow_path).exists() {
+        if let Ok(tf) = TcowFile::open(tcow_path) {
+            for (path, _) in tf.union_view() {
+                set.insert(path);
+            }
+        }
+    }
+    for (path, _) in pending_writes {
+        set.insert(path.clone());
+    }
+    let mut out: Vec<String> = set.into_iter().collect();
+    out.sort();
+    out
+}
+
+fn read_union_file(tcow_path: &str, pending_writes: &[(String, Vec<u8>)], path: &str) -> Result<Vec<u8>, String> {
+    let norm = normalize_vfs_path(path);
+    if norm.is_empty() {
+        return Err("missing file path".to_string());
+    }
+    if let Some((_, data)) = pending_writes.iter().rev().find(|(p, _)| p == &norm) {
+        return Ok(data.clone());
+    }
+    if !Path::new(tcow_path).exists() {
+        return Err(format!("file not found: {norm}"));
+    }
+    match TcowFile::open(tcow_path) {
+        Ok(tf) => match tf.resolve(&norm) {
+            Some((entry, _)) => Ok(entry.data),
+            None => Err(format!("file not found: {norm}")),
+        },
+        Err(e) => Err(format!("tcow open error: {e}")),
+    }
+}
+
+fn execute_shell_external(
+    command: &ParsedShellCommand,
+    shell_timeout: Option<u64>,
+) -> Result<String, String> {
+    let child = Command::new(&command.program)
+        .args(&command.args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn command: {e}"))?;
+    let start = Instant::now();
+    let output_opt = std::thread::scope(|s| {
+        let handle = s.spawn(|| child.wait_with_output());
+        loop {
+            if handle.is_finished() {
+                return handle.join().ok().and_then(|r| r.ok());
+            }
+            if let Some(secs) = shell_timeout {
+                if start.elapsed() >= Duration::from_secs(secs) {
+                    return None;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    match output_opt {
+        Some(output) => {
+            let mut combined = String::new();
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            combined.push_str(&stdout);
+            if !stderr.is_empty() {
+                if !combined.is_empty() && !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str(&stderr);
+            }
+            Ok(combined)
+        }
+        None => Ok(format!(
+            "shell emulator timeout: command exceeded {}s",
+            shell_timeout.unwrap_or(0)
+        )),
+    }
+}
+
+fn execute_shell_emulator(
+    tcow_path: &str,
+    pending_writes: &mut Vec<(String, Vec<u8>)>,
+    shell_allow: &[Regex],
+    shell_timeout: Option<u64>,
+    shell_cwd: &mut String,
+    command_text: &str,
+) -> Result<String, String> {
+    let parsed = match parse_shell_command(command_text) {
+        Ok(v) => v,
+        Err(ShellParseError::Unsupported(msg)) => return Ok(msg),
+        Err(ShellParseError::Invalid(msg)) => return Ok(format!("shell emulator error: {msg}")),
+    };
+
+    let full_cmd = if parsed.args.is_empty() {
+        parsed.program.clone()
+    } else {
+        format!("{} {}", parsed.program, parsed.args.join(" "))
+    };
+    let allowed = shell_allow.iter().any(|re| re.is_match(&full_cmd));
+    if !allowed {
+        return Err(format!(
+            "AI Policy Error: shell_execute command not in allow-list: \"{}\". Check template metadata.shell.allow.",
+            parsed.program
+        ));
+    }
+
+    let output = match parsed.program.as_str() {
+        "pwd" => {
+            if !parsed.args.is_empty() {
+                return Ok("shell emulator error: pwd does not accept parameters".to_string());
+            }
+            format!("{}\n", shell_cwd)
+        }
+        "cd" => {
+            if parsed.args.len() > 1 {
+                return Ok("shell emulator error: cd accepts zero or one path argument".to_string());
+            }
+            let target = parsed.args.get(0).map(|s| s.as_str()).unwrap_or("/");
+            let next = canonicalize_shell_path(shell_cwd, target);
+            if !directory_exists(tcow_path, pending_writes, &next) {
+                return Ok(format!("shell emulator error: directory not found: {target}"));
+            }
+            *shell_cwd = next;
+            String::new()
+        }
+        "echo" => {
+            let mut out = parsed.args.join(" ");
+            out.push('\n');
+            out
+        }
+        "cat" => {
+            if parsed.args.len() != 1 {
+                return Ok("shell emulator error: cat expects exactly one file or glob pattern".to_string());
+            }
+            let pattern_src = parsed.args[0].clone();
+            let wildcard = pattern_src.contains('*') || pattern_src.contains('?');
+            let pattern = if wildcard {
+                wildcard_pattern_to_rel(shell_cwd, &pattern_src)
+            } else {
+                abs_to_rel(&canonicalize_shell_path(shell_cwd, &pattern_src))
+            };
+            let wildcard = pattern.contains('*') || pattern.contains('?');
+            let matched = if wildcard {
+                list_union_paths(tcow_path, pending_writes)
+                    .into_iter()
+                    .filter(|p| glob_match(&pattern, p))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![pattern]
+            };
+            if matched.is_empty() {
+                return Ok("shell emulator error: cat pattern matched no files".to_string());
+            }
+            let mut parts: Vec<String> = Vec::new();
+            for path in matched {
+                let bytes = read_union_file(tcow_path, pending_writes, &path)?;
+                parts.push(String::from_utf8_lossy(&bytes).into_owned());
+            }
+            parts.join("\n")
+        }
+        "ls" => {
+            let pattern = if parsed.args.is_empty() {
+                String::new()
+            } else if parsed.args.len() == 1 {
+                parsed.args[0].clone()
+            } else {
+                return Ok("shell emulator error: ls accepts zero or one file pattern".to_string());
+            };
+            let wildcard = pattern.contains('*') || pattern.contains('?');
+            let mut entries: Vec<String> = if wildcard {
+                let rel_pattern = wildcard_pattern_to_rel(shell_cwd, &pattern);
+                list_union_paths(tcow_path, pending_writes)
+                    .into_iter()
+                    .filter(|p| glob_match(&rel_pattern, p))
+                    .collect()
+            } else if pattern.is_empty() {
+                list_dir_entries(tcow_path, pending_writes, shell_cwd)
+            } else {
+                let dir_abs = canonicalize_shell_path(shell_cwd, &pattern);
+                list_dir_entries(tcow_path, pending_writes, &dir_abs)
+            };
+            entries.sort();
+            let mut out = entries.join("\n");
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out
+        }
+        _ => execute_shell_external(&parsed, shell_timeout)?,
+    };
+
+    if let Some(path) = parsed.redirect_out {
+        let norm = abs_to_rel(&canonicalize_shell_path(shell_cwd, &path));
+        if norm.is_empty() {
+            return Ok("shell emulator error: invalid redirection target".to_string());
+        }
+        pending_writes.push((norm, output.into_bytes()));
+        Ok(String::new())
+    } else {
+        Ok(output)
+    }
+}
+
 struct HostState {
     prompt: String,
     final_answer: Option<String>,
@@ -281,6 +871,7 @@ struct HostState {
     provider_api_url: String,
     model: String,
     client: Client,
+    verbosity: Verbosity,
     wasi: WasiCtx,
     /// Path to the persistent .tcow virtual filesystem file.
     tcow_path: String,
@@ -291,6 +882,10 @@ struct HostState {
     shell_allow: Vec<Regex>,
     /// Wall-clock timeout for shell commands; `None` = wait indefinitely.
     shell_timeout: Option<u64>,
+    /// Current shell working directory for shell_execute in this session.
+    shell_cwd: String,
+    /// Initial shell directory preference for this session.
+    shell_workdir: String,
     /// Live child processes spawned this session, keyed by PID.
     running_processes: HashMap<u32, Child>,
     /// System prompt from template spec.system_prompt, if any.
@@ -468,35 +1063,51 @@ fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>
         .metadata
         .as_ref()
         .and_then(|m| m.shell.as_ref());
-    let allow_patterns = shell_cfg
+    let mut allow_patterns = shell_cfg
         .and_then(|s| s.allow.as_ref())
         .cloned()
         .unwrap_or_default();
     let timeout = shell_cfg.and_then(|s| s.timeout_secs);
-    let regexes = allow_patterns
-        .iter()
-        .map(|pat| Regex::new(pat).with_context(|| format!("invalid regex in template: {pat}")))
-        .collect::<Result<Vec<_>>>()?;
-    let auto_defs = template
+    let mut auto_defs = template
         .metadata
         .as_ref()
         .and_then(|m| m.auto_approve.as_ref())
         .cloned()
         .unwrap_or_default();
-    let auto_approve_rules = auto_defs
+    let (tools, inline_auto_defs, inline_allow_patterns) = parse_template_tools(
+        template.metadata.as_ref().and_then(|m| m.tools.as_ref()),
+    )?;
+    allow_patterns.extend(inline_allow_patterns);
+    let regexes = allow_patterns
         .iter()
-        .map(|rule| {
-            let compiled = rule
-                .pattern
-                .as_deref()
-                .map(|pat| Regex::new(pat).with_context(|| format!("invalid auto_approve regex in template: {pat}")))
-                .transpose()?;
-            Ok(AutoApproveRule {
-                tool: rule.tool.clone(),
-                pattern: compiled,
-            })
-        })
+        .map(|pat| Regex::new(pat).with_context(|| format!("invalid regex in template: {pat}")))
         .collect::<Result<Vec<_>>>()?;
+    auto_defs.extend(inline_auto_defs);
+    let mut auto_approve_rules: Vec<AutoApproveRule> = Vec::new();
+    for rule in &auto_defs {
+        for pat in &rule.patterns {
+            let compiled = Regex::new(pat)
+                .with_context(|| format!("invalid auto_approve regex in template: {pat}"))?;
+            auto_approve_rules.push(AutoApproveRule {
+                tool: rule.tool.clone(),
+                pattern: Some(compiled),
+            });
+        }
+        if let Some(pat) = rule.pattern.as_deref() {
+            let compiled = Regex::new(pat)
+                .with_context(|| format!("invalid auto_approve regex in template: {pat}"))?;
+            auto_approve_rules.push(AutoApproveRule {
+                tool: rule.tool.clone(),
+                pattern: Some(compiled),
+            });
+        }
+        if rule.pattern.is_none() && rule.patterns.is_empty() {
+            auto_approve_rules.push(AutoApproveRule {
+                tool: rule.tool.clone(),
+                pattern: None,
+            });
+        }
+    }
     let mut system_prompt = template.spec.as_ref().and_then(|s| s.system_prompt.clone());
     let max_steps = template
         .metadata
@@ -541,33 +1152,11 @@ fn load_template(path: &Path) -> Result<(Vec<Regex>, Option<u64>, Option<String>
         .as_ref()
         .and_then(|m| m.model.clone())
         .filter(|m| !m.trim().is_empty());
-    let tools = template
-        .metadata
-        .as_ref()
-        .and_then(|m| m.tools.clone())
-        .unwrap_or_else(all_tool_names);
     let ignore_ssl = template
         .metadata
         .as_ref()
         .and_then(|m| m.ignore_ssl)
         .unwrap_or(false);
-    println!(
-        "[HOST] Template loaded: {} shell allow-list entries, timeout: {}, model: {}, system_prompt: {}, max_steps: {}, validate: {}, max_validation_fails: {}, tools: [{}], hooks: {}, labels: {}, context_window: {}, ignore_ssl: {}",
-        regexes.len(),
-        timeout.map(|t| format!("{t}s")).unwrap_or_else(|| "indefinite".into()),
-        template_model.clone().unwrap_or_else(|| "unset".into()),
-        system_prompt.as_deref().map(|s| format!("{} chars", s.len())).unwrap_or_else(|| "none".into()),
-        max_steps.map(|n| n.to_string()).unwrap_or_else(|| "indefinite".into()),
-        if validate_fn.is_some() { "yes" } else { "no" },
-        max_validation_fails
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "indefinite".into()),
-        tools.join(", "),
-        hooks.len(),
-        labels.len(),
-        template_context_window.map(|n| format!("{n}")).unwrap_or_else(|| "unset".into()),
-        ignore_ssl,
-    );
     Ok((regexes, timeout, system_prompt, max_steps, validate_fn, max_validation_fails, tools, auto_approve_rules, template_context_window, hooks, description, labels, template_model, ignore_ssl))
 }
 
@@ -579,6 +1168,50 @@ fn parse_provider_model(raw_model: &str) -> (ModelProvider, String) {
         return (ModelProvider::Xai, name.to_string());
     }
     (ModelProvider::Xai, raw_model.to_string())
+}
+
+fn print_guest_event(verbosity: Verbosity, line: &str) {
+    match verbosity {
+        Verbosity::VeryVerbose | Verbosity::HookTrace => {
+            println!("[GUEST] {line}");
+        }
+        Verbosity::Verbose => {
+            if let Some(rest) = line.strip_prefix("Received prompt: ") {
+                println!("user: {rest}");
+                return;
+            }
+            if let Some(rest) = line.strip_prefix("Tool result (") {
+                if let Some(idx) = rest.find("): ") {
+                    let call_id = &rest[..idx];
+                    println!("tool_response {call_id}: {}", &rest[idx + 3..]);
+                } else {
+                    println!("tool_response: {rest}");
+                }
+                return;
+            }
+            if let Some(raw) = line.strip_prefix("LLM raw response: ") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+                    if v["type"].as_str() == Some("tool_call") {
+                        let tools = v["tool_calls"]
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|tc| tc["tool"].as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .unwrap_or_default();
+                        if tools.is_empty() {
+                            println!("tool_call");
+                        } else {
+                            println!("tool_call: {tools}");
+                        }
+                    }
+                }
+            }
+        }
+        Verbosity::Default | Verbosity::Quiet => {}
+    }
 }
 
 // ── Copilot Internal API Auth ─────────────────────────────────────────────────
@@ -833,6 +1466,69 @@ fn lookup_model_context_window(model: &str) -> Option<u64> {
     Some(window)
 }
 
+fn print_help() {
+        print!(
+                r#"wasm1 - Step-wise Wasm agent runtime
+
+Usage:
+    wasm1 [global options] <command>
+
+Global options:
+    -h, --help        Show this help text
+    -q, --quiet       Quiet mode: no stdout output (errors still go to stderr)
+    -v                Mid verbosity: print user/assistant/tool events
+    -vv               Full verbosity: host and guest debug tracing
+    -vvv              Hook trace verbosity: includes hook evaluation order and step I/O
+
+Commands:
+    -t <template> [prompt]
+            Start a new session from a template and run one step.
+            If prompt is omitted, creates an initialized IDLE session only.
+
+    -s <session_id> [prompt]
+            Resume an existing session for one step.
+            If prompt is provided, starts a fresh user turn in that session.
+
+    -s <session_id> exec <command>
+            Execute one minimal shell command in the session shell emulator context
+            (uses session TCOW filesystem and metadata.cwd/workdir).
+            Does not append chat messages to session spec.messages.
+
+    cron [watch|once [agent_pattern]] [-t <template>] [-v]
+            Cron scheduler mode.
+            watch: run continuously and trigger matching agents on schedule.
+            once: run one cron tick, optionally filtered by agent regex/pattern.
+
+    clean
+            Remove stale temporary/session artifacts managed by wasm1.
+
+Prompt input options:
+    -i, --stdin
+            Read initial prompt from stdin (new sessions).
+
+Default stdout behavior:
+    none: print only final assistant response (if any)
+    -v:   print simplified user/assistant/tool events
+    -vv:  print full host/guest diagnostics
+    -vvv: include detailed hook lifecycle tracing (considered/executed/order/input/output)
+    -q:   suppress stdout
+
+Examples:
+    wasm1
+    wasm1 --help
+    wasm1 -t toolshed "find how to use slack chat"
+    wasm1 -t toolshed
+    wasm1 -s 1774737544123-248543-3ad5
+    wasm1 -s 1774737544123-248543-3ad5 exec "skills"
+    wasm1 -s 1774737544123-248543-3ad5 exec "echo hello > out.txt"
+    wasm1 cron watch
+    wasm1 cron once
+    wasm1 cron once "^desk-.*"
+    echo "summarize this" | wasm1 -i -t toolshed
+"#
+        );
+}
+
 fn main() -> Result<()> {
     // Capture where the user actually ran the command from, before any cd.
     let invocation_cwd = env::current_dir().context("failed to get current directory")?;
@@ -842,6 +1538,10 @@ fn main() -> Result<()> {
     //   wasm1 cron once <agent_pattern>
     //   wasm1 [-t <template>] <prompt>
     let all_args: Vec<String> = env::args().skip(1).collect();
+    if all_args.is_empty() || all_args.iter().any(|a| a == "-h" || a == "--help") {
+        print_help();
+        return Ok(());
+    }
     if all_args.first().map(String::as_str) == Some("cron") {
         let mut mode = "watch";
         let mut once_agent_pattern: Option<String> = None;
@@ -897,6 +1597,8 @@ fn main() -> Result<()> {
     let mut session_name: Option<String> = None;
     let mut read_stdin = false;
     let mut prompt: Option<String> = None;
+    let mut exec_command: Option<String> = None;
+    let mut verbosity = Verbosity::Default;
     while let Some(arg) = args_iter.next() {
         if arg == "-t" || arg == "--template" {
             template_name = Some(
@@ -910,8 +1612,29 @@ fn main() -> Result<()> {
                     .next()
                     .ok_or_else(|| anyhow!("missing session id after {arg}"))?,
             );
+        } else if arg == "-q" || arg == "--quiet" {
+            verbosity = Verbosity::Quiet;
+        } else if arg == "-v" {
+            if !verbosity.is_quiet() {
+                verbosity = Verbosity::Verbose;
+            }
+        } else if arg == "-vv" {
+            if !verbosity.is_quiet() {
+                verbosity = Verbosity::VeryVerbose;
+            }
+        } else if arg == "-vvv" {
+            if !verbosity.is_quiet() {
+                verbosity = Verbosity::HookTrace;
+            }
         } else if arg == "-i" || arg == "--stdin" {
             read_stdin = true;
+        } else if arg == "exec" && session_name.is_some() {
+            let tail: Vec<String> = args_iter.collect();
+            if tail.is_empty() {
+                return Err(anyhow!("missing command after exec"));
+            }
+            exec_command = Some(tail.join(" "));
+            break;
         } else {
             prompt = Some(match prompt {
                 Some(existing) => format!("{existing} {arg}"),
@@ -924,7 +1647,7 @@ fn main() -> Result<()> {
     }
     if session_name.is_none() && template_name.is_none() && prompt.is_none() {
         return Err(anyhow!(
-            "usage: wasm1 [clean|cron [watch|once [agent_pattern]]|-t <template> [prompt]|-s <session_id> [prompt]]"
+            "usage: wasm1 [-q|-v|-vv|-vvv] [clean|cron [watch|once [agent_pattern]]|-t <template> [prompt]|-s <session_id> [prompt]|-s <session_id> exec <command>]"
         ));
     }
     let is_resume_mode = session_name.is_some();
@@ -934,13 +1657,17 @@ fn main() -> Result<()> {
     // and cd there so .agent/, .tokens.yaml, .env, guest.wasm etc. all resolve
     // correctly regardless of where the binary was invoked from.
     let workspace_root = resolve_workspace_root()?;
-    if workspace_root != invocation_cwd {
+    if verbosity.is_very_verbose() && workspace_root != invocation_cwd {
         println!("[HOST] Workspace root: {}", rel_path(&invocation_cwd, &workspace_root));
     }
     env::set_current_dir(&workspace_root)
         .with_context(|| format!("failed to set working directory to {}", workspace_root.display()))?;
     // Load .env from workspace root (now the cwd).
     let _ = from_filename(".env");
+
+    if let (Some(session_id), Some(command)) = (session_name.as_deref(), exec_command.as_deref()) {
+        return run_session_exec(session_id, command, &invocation_cwd, &workspace_root, verbosity);
+    }
 
     // For template lookup: search invocation cwd first, then workspace root.
     let extra_roots: Vec<&Path> = if invocation_cwd != workspace_root {
@@ -952,7 +1679,9 @@ fn main() -> Result<()> {
     // Load template allow-list if -t was supplied
     let (mut shell_allow, mut shell_timeout, mut system_prompt, max_steps, validate_fn, max_validation_fails, mut enabled_tools, mut auto_approve_rules, template_context_window, template_hooks, mut template_description, mut template_labels, template_model, ignore_ssl_template) = if let Some(ref name) = template_name {
         let path = resolve_template(name, &extra_roots)?;
-        println!("[HOST] Using template: {}", path.display());
+        if verbosity.is_very_verbose() {
+            println!("[HOST] Using template: {}", path.display());
+        }
         load_template(&path)?
     } else {
         (Vec::new(), SHELL_TIMEOUT_DEFAULT, None, None, None, None, all_tool_names(), Vec::new(), None, Vec::new(), None, Vec::new(), None, false)
@@ -963,11 +1692,13 @@ fn main() -> Result<()> {
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
     let ignore_ssl = ignore_ssl_template || ignore_ssl_env;
-    if ignore_ssl_env && !ignore_ssl_template {
+    if verbosity.is_very_verbose() && ignore_ssl_env && !ignore_ssl_template {
         println!("[HOST] SSL certificate validation disabled via WASM1_IGNORE_SSL env var");
     }
     let effective_hooks = merge_hooks(load_global_hooks()?, template_hooks);
-    println!("[HOST] Hooks loaded: {}", effective_hooks.len());
+    if verbosity.is_very_verbose() {
+        println!("[HOST] Hooks loaded: {}", effective_hooks.len());
+    }
 
     let mut seed_history: Vec<HistoryEntry> = Vec::new();
     let mut seed_validation_feedback: Vec<String> = Vec::new();
@@ -977,12 +1708,22 @@ fn main() -> Result<()> {
     let mut seed_blocked_on_approval = false;
     let mut resume_model: Option<String> = None;
     let mut resume_prev_state: Option<String> = None;
-    let (session_id, session_created, prompt) = if let Some(session_id) = session_name.clone() {
+    let (session_id, session_created, prompt, shell_cwd, shell_workdir) = if let Some(session_id) = session_name.clone() {
         let session_path = invocation_cwd
             .join(".agent/sessions")
             .join(format!("{session_id}.yaml"));
         let snapshot = load_session_seed(&session_path)?;
         let SessionSnapshotIn { metadata, spec } = snapshot;
+        let resume_workdir = metadata
+            .workdir
+            .clone()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "/".to_string());
+        let resume_cwd = metadata
+            .cwd
+            .clone()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| resume_workdir.clone());
         seed_messages = normalize_session_messages(&spec.messages);
         let (seed_prompt, parsed_history, parsed_feedback, parsed_step, parsed_pending_calls, blocked_on_approval) =
             session_seed_from_messages(&spec.messages);
@@ -1035,7 +1776,7 @@ fn main() -> Result<()> {
         } else {
             seed_prompt
         };
-        (metadata.id, created, effective_prompt)
+        (metadata.id, created, effective_prompt, resume_cwd, resume_workdir)
     } else {
         // Generate canonical session ID: <timestampMs>-<pid>-<hex4>
         let session_ts = SystemTime::now()
@@ -1051,7 +1792,13 @@ fn main() -> Result<()> {
             format!("{:02x}{:02x}", digest[0], digest[1])
         };
         let new_id = format!("{session_ts}-{session_pid}-{session_rand}");
-        (new_id, now_stamp(), prompt.unwrap_or_default())
+        (
+            new_id,
+            now_stamp(),
+            prompt.unwrap_or_default(),
+            "/".to_string(),
+            "/".to_string(),
+        )
     };
 
     if !is_resume_mode {
@@ -1086,7 +1833,11 @@ fn main() -> Result<()> {
         }
     }
 
-    println!("[HOST] Starting agent with prompt: {:?}", prompt);
+    if verbosity.is_very_verbose() {
+        println!("[HOST] Starting agent with prompt: {:?}", prompt);
+    } else if verbosity.is_verbose() {
+        println!("user: {}", prompt);
+    }
 
     let model = template_model
         .or(resume_model)
@@ -1104,6 +1855,8 @@ fn main() -> Result<()> {
                 name: template_name.clone().unwrap_or_else(|| "solo".to_string()),
                 model: model.clone(),
                 status: "IDLE".to_string(),
+                cwd: shell_cwd.clone(),
+                workdir: shell_workdir.clone(),
                 created: session_created.clone(),
                 last_pid: std::process::id(),
                 tools: enabled_tools.clone(),
@@ -1151,14 +1904,18 @@ fn main() -> Result<()> {
         ModelProvider::Xai => "xai",
         ModelProvider::Copilot => "copilot",
     };
-    println!(
-        "[HOST] Provider: {provider_name} | Model: {model} (native={model_name}) | Auth: loaded | context_window: {}",
-        context_window.map(|n| format!("{n} tokens")).unwrap_or_else(|| "unknown (set metadata.context_window in template)".into()),
-    );
+    if verbosity.is_very_verbose() {
+        println!(
+            "[HOST] Provider: {provider_name} | Model: {model} (native={model_name}) | Auth: loaded | context_window: {}",
+            context_window.map(|n| format!("{n} tokens")).unwrap_or_else(|| "unknown (set metadata.context_window in template)".into()),
+        );
+    }
 
     ensure_guest_wasm()?;
 
-    println!("[HOST] Instantiating guest Wasm module (fuel limit: {FUEL_LIMIT})...");
+    if verbosity.is_very_verbose() {
+        println!("[HOST] Instantiating guest Wasm module (fuel limit: {FUEL_LIMIT})...");
+    }
 
     let mut config = Config::new();
     config.consume_fuel(true);
@@ -1271,7 +2028,8 @@ fn main() -> Result<()> {
         "host_log",
         |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| {
             if let Ok(line) = read_memory(&mut caller, ptr, len) {
-                println!("[GUEST] {line}");
+                let verbosity = caller.data().verbosity;
+                print_guest_event(verbosity, &line);
             }
         },
     )?;
@@ -1281,7 +2039,12 @@ fn main() -> Result<()> {
         "emit_final",
         |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| {
             if let Ok(answer) = read_memory(&mut caller, ptr, len) {
-                println!("[HOST] Agent loop complete. Final answer: {answer}");
+                match caller.data().verbosity {
+                    Verbosity::VeryVerbose | Verbosity::HookTrace => println!("[HOST] Agent loop complete. Final answer: {answer}"),
+                    Verbosity::Verbose => println!("assistant: {answer}"),
+                    Verbosity::Default => println!("{answer}"),
+                    Verbosity::Quiet => {}
+                }
                 caller.data_mut().final_answer = Some(answer);
             }
         },
@@ -1459,6 +2222,7 @@ fn main() -> Result<()> {
                 "filter_inf_req",
                 &inf_req_payload,
                 true,
+                caller.data().verbosity,
             ) {
                 Ok(run_result) => {
                     if let Some(reason) = run_result.blocked_reason {
@@ -1494,7 +2258,9 @@ fn main() -> Result<()> {
                 }
             }
 
-            println!("[GUEST → LLM] step={} sending request", req.step);
+            if caller.data().verbosity.is_very_verbose() {
+                println!("[GUEST → LLM] step={} sending request", req.step);
+            }
             let decision = match llm_decide(caller.data(), &req) {
                 Ok(v) => v,
                 Err(err) => LlmDecision::Error {
@@ -1504,7 +2270,9 @@ fn main() -> Result<()> {
             };
 
             if let LlmDecision::ToolCall { tool_calls, .. } = &decision {
-                println!("[LLM → GUEST] Tool calls: {}", tool_calls.len());
+                if caller.data().verbosity.is_very_verbose() {
+                    println!("[LLM → GUEST] Tool calls: {}", tool_calls.len());
+                }
             }
 
             let inf_res_payload = match &decision {
@@ -1634,7 +2402,9 @@ fn main() -> Result<()> {
                 .pending_writes
                 .push((vfs_path.clone(), initial_json.into_bytes()));
 
-            println!("[HOST] shell_run: spawning {:?} {:?}", cmd, args);
+            if caller.data().verbosity.is_very_verbose() {
+                println!("[HOST] shell_run: spawning {:?} {:?}", cmd, args);
+            }
             let start = Instant::now();
 
             // Spawn child
@@ -1647,7 +2417,9 @@ fn main() -> Result<()> {
 
             let child = match child_result {
                 Err(e) => {
-                    println!("[HOST] shell_run: spawn failed: {e}");
+                    if caller.data().verbosity.is_very_verbose() {
+                        println!("[HOST] shell_run: spawn failed: {e}");
+                    }
                     return -2;
                 }
                 Ok(c) => c,
@@ -1704,7 +2476,9 @@ fn main() -> Result<()> {
                 },
                 None => {
                     let t = shell_timeout.unwrap_or(0);
-                    println!("[HOST] shell_run: timed out after {t}s");
+                    if caller.data().verbosity.is_very_verbose() {
+                        println!("[HOST] shell_run: timed out after {t}s");
+                    }
                     ShellOut {
                         pid,
                         status: "timeout".into(),
@@ -1822,7 +2596,9 @@ fn main() -> Result<()> {
                 .pending_writes
                 .push((vfs_path, initial_json.into_bytes()));
 
-            println!("[HOST] shell_run_async: spawning {:?} {:?}", cmd, args);
+            if caller.data().verbosity.is_very_verbose() {
+                println!("[HOST] shell_run_async: spawning {:?} {:?}", cmd, args);
+            }
 
             // Spawn child without waiting
             let child_result = Command::new(&cmd)
@@ -1834,7 +2610,9 @@ fn main() -> Result<()> {
 
             let child = match child_result {
                 Err(e) => {
-                    println!("[HOST] shell_run_async: spawn failed: {e}");
+                    if caller.data().verbosity.is_very_verbose() {
+                        println!("[HOST] shell_run_async: spawn failed: {e}");
+                    }
                     return -2;
                 }
                 Ok(c) => c,
@@ -1989,6 +2767,23 @@ fn main() -> Result<()> {
             }
 
             let result: Result<String, String> = match name.as_str() {
+                "shell_execute" => {
+                    let command = args["command"].as_str().unwrap_or("");
+                    let tcow_path = caller.data().tcow_path.clone();
+                    let shell_allow = caller.data().shell_allow.clone();
+                    let shell_timeout = caller.data().shell_timeout;
+                    {
+                        let data = caller.data_mut();
+                        execute_shell_emulator(
+                            tcow_path.as_str(),
+                            &mut data.pending_writes,
+                            shell_allow.as_slice(),
+                            shell_timeout,
+                            &mut data.shell_cwd,
+                            command,
+                        )
+                    }
+                }
                 "fs__file__view" => {
                     let file_path = args["filePath"]
                         .as_str()
@@ -2200,13 +2995,17 @@ fn main() -> Result<()> {
         },
     )?;
 
-    println!("[HOST] Session: {session_id}");
+    if verbosity.is_very_verbose() {
+        println!("[HOST] Session: {session_id}");
+    }
 
     // .agent/fs is local to the invocation cwd (each working directory gets its own vfs)
     let tcow_dir = invocation_cwd.join(".agent/fs");
     std::fs::create_dir_all(&tcow_dir).context("failed to create .agent/fs/")?;
     let tcow_path_buf = tcow_dir.join(format!("{session_id}.tcow"));
-    println!("[HOST] TCOW virtual FS: {}", rel_path(&invocation_cwd, &tcow_path_buf));
+    if verbosity.is_very_verbose() {
+        println!("[HOST] TCOW virtual FS: {}", rel_path(&invocation_cwd, &tcow_path_buf));
+    }
     let tcow_path = tcow_path_buf.to_string_lossy().into_owned();
 
     // .agent/sessions resolves relative to invocation cwd
@@ -2223,11 +3022,14 @@ fn main() -> Result<()> {
         provider_api_url,
         model,
         client,
+        verbosity,
         wasi,
         tcow_path,
         pending_writes: Vec::new(),
         shell_allow,
         shell_timeout,
+        shell_cwd,
+        shell_workdir,
         running_processes: HashMap::new(),
         system_prompt,
         max_steps,
@@ -2285,7 +3087,9 @@ fn main() -> Result<()> {
         if !state.pending_writes.is_empty() {
             let tcow_path = &state.tcow_path;
             let writes = &state.pending_writes;
-            println!("[HOST] Flushing {} write(s) to {}", writes.len(), rel_path(&state.invocation_cwd, Path::new(tcow_path)));
+            if state.verbosity.is_very_verbose() {
+                println!("[HOST] Flushing {} write(s) to {}", writes.len(), rel_path(&state.invocation_cwd, Path::new(tcow_path)));
+            }
             if Path::new(tcow_path).exists() {
                 TcowFile::append_delta(tcow_path, writes, &[])
                     .context("failed to append delta layer to .tcow")?;
@@ -2293,18 +3097,26 @@ fn main() -> Result<()> {
                 TcowFile::create(tcow_path, writes, &[], None)
                     .context("failed to create .tcow file")?;
             }
-            println!("[HOST] TCOW flush complete.");
+            if state.verbosity.is_very_verbose() {
+                println!("[HOST] TCOW flush complete.");
+            }
         } else {
-            println!("[HOST] No TCOW writes this run.");
+            if state.verbosity.is_very_verbose() {
+                println!("[HOST] No TCOW writes this run.");
+            }
         }
     }
 
     let consumed = store.fuel_consumed().unwrap_or(0);
     let remaining = FUEL_LIMIT.saturating_sub(consumed);
-    println!("[HOST] Fuel consumed: {consumed} / {FUEL_LIMIT} (remaining: {remaining})");
+    if store.data().verbosity.is_very_verbose() {
+        println!("[HOST] Fuel consumed: {consumed} / {FUEL_LIMIT} (remaining: {remaining})");
+    }
 
     if store.data().final_answer.is_none() {
-        println!("[HOST] Agent completed without final answer export.");
+        if store.data().verbosity.is_very_verbose() {
+            println!("[HOST] Agent completed without final answer export.");
+        }
     }
 
     let had_final = store.data().final_answer.is_some();
@@ -2327,8 +3139,10 @@ fn main() -> Result<()> {
         false,
     )?;
 
-    let summary_path = format!(".agent/sessions/{}.yaml", store.data().session_id);
-    println!("{} {} {}", store.data().session_id, store.data().session_state, summary_path);
+    if store.data().verbosity.is_very_verbose() {
+        let summary_path = format!(".agent/sessions/{}.yaml", store.data().session_id);
+        println!("{} {} {}", store.data().session_id, store.data().session_state, summary_path);
+    }
 
     Ok(())
 }
@@ -2338,6 +3152,107 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn run_session_exec(
+    session_id: &str,
+    command: &str,
+    invocation_cwd: &Path,
+    workspace_root: &Path,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let session_path = invocation_cwd
+        .join(".agent/sessions")
+        .join(format!("{session_id}.yaml"));
+    let snapshot = load_session_seed(&session_path)
+        .with_context(|| format!("failed to load session: {}", session_path.display()))?;
+
+    let mut shell_allow: Vec<Regex> = Vec::new();
+    let mut shell_timeout = SHELL_TIMEOUT_DEFAULT;
+    let mut roots: Vec<&Path> = vec![workspace_root];
+    if invocation_cwd != workspace_root {
+        roots.push(invocation_cwd);
+    }
+    if !snapshot.metadata.name.is_empty() {
+        if let Ok(path) = resolve_template(&snapshot.metadata.name, &roots) {
+            if let Ok((allow, timeout, _, _, _, _, _, _, _, _, _, _, _, _)) = load_template(&path) {
+                shell_allow = allow;
+                shell_timeout = timeout;
+            }
+        }
+    }
+
+    let tcow_path_buf = invocation_cwd.join(".agent/fs").join(format!("{session_id}.tcow"));
+    let tcow_path = tcow_path_buf.to_string_lossy().to_string();
+    let mut pending_writes: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut shell_cwd = snapshot
+        .metadata
+        .cwd
+        .clone()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            snapshot
+                .metadata
+                .workdir
+                .clone()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_else(|| "/".to_string());
+    let output = execute_shell_emulator(
+        tcow_path.as_str(),
+        &mut pending_writes,
+        shell_allow.as_slice(),
+        shell_timeout,
+        &mut shell_cwd,
+        command,
+    )
+    .map_err(|e| anyhow!(e))?;
+
+    if !pending_writes.is_empty() {
+        if Path::new(&tcow_path).exists() {
+            TcowFile::append_delta(&tcow_path, &pending_writes, &[])
+                .context("failed to append delta layer to .tcow")?;
+        } else {
+            TcowFile::create(&tcow_path, &pending_writes, &[], None)
+                .context("failed to create .tcow file")?;
+        }
+    }
+
+    update_session_metadata_cwd(&session_path, &shell_cwd)?;
+
+    if !verbosity.is_quiet() {
+        if output.ends_with('\n') {
+            print!("{output}");
+        } else {
+            println!("{output}");
+        }
+    }
+    Ok(())
+}
+
+fn update_session_metadata_cwd(session_path: &Path, cwd: &str) -> Result<()> {
+    let raw = fs::read_to_string(session_path)
+        .with_context(|| format!("failed to read session YAML: {}", session_path.display()))?;
+    let mut root: serde_yaml::Value = serde_yaml::from_str(&raw)
+        .with_context(|| format!("failed to parse session YAML: {}", session_path.display()))?;
+
+    let root_map = root
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("session YAML root is not a mapping"))?;
+    let md_key = serde_yaml::Value::String("metadata".to_string());
+    let metadata = root_map
+        .get_mut(&md_key)
+        .and_then(|v| v.as_mapping_mut())
+        .ok_or_else(|| anyhow!("session YAML metadata is missing or invalid"))?;
+    metadata.insert(
+        serde_yaml::Value::String("cwd".to_string()),
+        serde_yaml::Value::String(cwd.to_string()),
+    );
+
+    let out = serde_yaml::to_string(&root).context("failed to serialize updated session YAML")?;
+    fs::write(session_path, out)
+        .with_context(|| format!("failed to write session YAML: {}", session_path.display()))?;
+    Ok(())
 }
 
 fn now_stamp() -> String {
@@ -3041,7 +3956,7 @@ fn run_cron_tick(
 
         let hook_started = Instant::now();
         stats.hooks_ran += 1;
-        let run = execute_hook_collect(hook, &base, workspace_root);
+        let run = execute_hook_collect(hook, &base, workspace_root, Verbosity::Default);
         match run {
             Ok(run_result) => {
                 let mut latest_state = load_cron_state(workspace_root)?;
@@ -3207,8 +4122,27 @@ fn run_hooks(
         event,
         payload,
         blocking,
+        state.verbosity,
     )?
     .blocked_reason)
+}
+
+fn hook_compact_json(value: &serde_json::Value, max_len: usize) -> String {
+    let mut s = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+    if s.len() > max_len {
+        s.truncate(max_len);
+        s.push_str("...");
+    }
+    s
+}
+
+fn hook_compact_text(value: &str, max_len: usize) -> String {
+    let mut s = value.replace('\n', "\\n");
+    if s.len() > max_len {
+        s.truncate(max_len);
+        s.push_str("...");
+    }
+    s
 }
 
 fn run_hooks_collect(
@@ -3218,6 +4152,7 @@ fn run_hooks_collect(
     event: &str,
     payload: &serde_json::Value,
     blocking: bool,
+    verbosity: Verbosity,
 ) -> Result<HookRunResult> {
     let mut base = serde_json::json!({
         "hook": event,
@@ -3229,16 +4164,90 @@ fn run_hooks_collect(
     merge_json_object(&mut base, payload);
 
     let mut aggregated = HookRunResult::default();
+    let mut order = 0usize;
 
-    for hook in hooks
-        .iter()
-        .filter(|h| h.on == event && h.enabled.unwrap_or(true))
-    {
-        if !hook_matches(hook, &base) {
+    if verbosity.is_very_verbose() {
+        println!(
+            "[HOOK] event={} blocking={} hooks_total={}",
+            event,
+            blocking,
+            hooks.len()
+        );
+    }
+
+    for hook in hooks.iter() {
+        if hook.on != event {
+            if verbosity.is_hook_trace() {
+                println!(
+                    "[HOOK] event={} hook={} considered=false reason=event_mismatch expected={} actual={}",
+                    event,
+                    hook.name,
+                    event,
+                    hook.on
+                );
+            }
             continue;
         }
-        match execute_hook_collect(hook, &base, workspace_root) {
+        if !hook.enabled.unwrap_or(true) {
+            if verbosity.is_very_verbose() {
+                println!(
+                    "[HOOK] event={} hook={} considered=true executed=false reason=disabled",
+                    event,
+                    hook.name
+                );
+            }
+            continue;
+        }
+        if !hook_matches(hook, &base) {
+            if verbosity.is_very_verbose() {
+                println!(
+                    "[HOOK] event={} hook={} considered=true executed=false reason=when_mismatch",
+                    event,
+                    hook.name
+                );
+            }
+            continue;
+        }
+
+        order += 1;
+        if verbosity.is_very_verbose() {
+            println!(
+                "[HOOK] event={} hook={} order={} executing",
+                event,
+                hook.name,
+                order
+            );
+        }
+        if verbosity.is_hook_trace() {
+            println!(
+                "[HOOK] event={} hook={} input={}",
+                event,
+                hook.name,
+                hook_compact_json(&base, 600)
+            );
+        }
+
+        match execute_hook_collect(hook, &base, workspace_root, verbosity) {
             Ok(run_result) => {
+                if verbosity.is_very_verbose() {
+                    println!(
+                        "[HOOK] event={} hook={} done blocked={} has_llm_output={}",
+                        event,
+                        hook.name,
+                        run_result.blocked_reason.is_some(),
+                        run_result.last_llm_output.is_some(),
+                    );
+                }
+                if verbosity.is_hook_trace() {
+                    if let Some(ref out) = run_result.last_llm_output {
+                        println!(
+                            "[HOOK] event={} hook={} output.last_llm_output={}",
+                            event,
+                            hook.name,
+                            hook_compact_text(out, 600)
+                        );
+                    }
+                }
                 if let Some(last) = run_result.last_llm_output {
                     aggregated.last_llm_output = Some(last);
                 }
@@ -3298,6 +4307,7 @@ fn execute_hook_collect(
     hook: &HookDef,
     payload: &serde_json::Value,
     workspace_root: &Path,
+    verbosity: Verbosity,
 ) -> Result<HookRunResult> {
     let mut completed: HashMap<String, ()> = HashMap::new();
     let mut outputs: HashMap<String, String> = HashMap::new();
@@ -3319,9 +4329,31 @@ fn execute_hook_collect(
             }
             let mut job_outputs: HashMap<String, String> = HashMap::new();
             for (idx, step) in job.steps.iter().enumerate() {
+                let step_id = step.id.clone().unwrap_or_else(|| format!("step_{idx}"));
+                if verbosity.is_hook_trace() {
+                    let mut output_keys: Vec<String> = outputs.keys().cloned().collect();
+                    output_keys.sort();
+                    println!(
+                        "[HOOK] hook={} job={} step={} type={} input.payload={} input.output_keys={}",
+                        hook.name,
+                        job_name,
+                        step_id,
+                        step.step_type,
+                        hook_compact_json(payload, 300),
+                        output_keys.join(",")
+                    );
+                }
                 let step_out = execute_hook_step(step, payload, &outputs, workspace_root)
                     .with_context(|| format!("job={job_name} step={}", step.id.clone().unwrap_or_else(|| idx.to_string())))?;
-                let step_id = step.id.clone().unwrap_or_else(|| format!("step_{idx}"));
+                if verbosity.is_hook_trace() {
+                    println!(
+                        "[HOOK] hook={} job={} step={} output={}",
+                        hook.name,
+                        job_name,
+                        step_id,
+                        hook_compact_text(&step_out, 500)
+                    );
+                }
                 job_outputs.insert(step_id.clone(), step_out.clone());
                 outputs.insert(step_id, step_out.clone());
 
@@ -4077,6 +5109,8 @@ fn write_session_snapshot(
             name: state.template_name.clone(),
             model: state.model.clone(),
             status: session_state.to_string(),
+            cwd: state.shell_cwd.clone(),
+            workdir: state.shell_workdir.clone(),
             created: state.session_created.clone(),
             last_pid: std::process::id(),
             tools: state.enabled_tools.clone(),
@@ -4642,7 +5676,7 @@ fn team_destroy(workspace_root: &Path, args: &serde_json::Value) -> Result<Strin
 
 fn all_tool_names() -> Vec<String> {
     [
-        "js_exec",
+        "shell_execute",
         "fs__file__view",
         "fs__file__create",
         "fs__file__edit",
@@ -4665,16 +5699,9 @@ fn all_tool_names() -> Vec<String> {
 fn build_tools_json(enabled: &[String]) -> String {
     let all: &[(&str, &str, &str)] = &[
         (
-            "js_exec",
-            "Execute server-side JavaScript in a secured environment. \
-            To run a shell command synchronously (blocking), use `console.log(require('shell').runSync('echo', ['hello']))`, which blocks until \
-            the process exits and returns a message like \"Program PID {pid} exited with code {exit_code} \
-            and its output ({line_count} line(s), {byte_count} byte(s)) was written to file: {file}\". \
-            To run a shell command asynchronously (non-blocking), use `console.log(require('shell').run('echo', ['hello']))`, which returns \
-            immediately with \"Program PID {pid} launched and output is streaming to file: {file}\". \
-            You can also read files with `console.log(fs.readFileSync(\"/somefile.txt\"))` and write files with \
-            `fs.writeFileSync(\"/somefile.txt\", \"content\")`",
-            r#"{"type":"object","properties":{"code":{"type":"string","description":"JS code to run."}},"required":["code"]}"#,
+            "shell_execute",
+            "Execute a single command in the constrained shell emulator. Supports basic quoting, environment forwarding, and output redirection with '>'. Unsupported features (pipes, subshells, variable expansion, export, &&, background jobs) return guidance text.",
+            r#"{"type":"object","properties":{"command":{"type":"string","description":"Single shell command to execute."}},"required":["command"]}"#,
         ),
         (
             "fs__file__view",
@@ -4776,11 +5803,8 @@ fn format_tool_result(result_json: &str) -> String {
 }
 
 fn auto_approve_match_text(call: &ToolInvocation) -> String {
-    if call.tool == "shell__execute" {
+    if call.tool == "shell_execute" {
         return call.args["command"].as_str().unwrap_or("").to_string();
-    }
-    if call.tool == "js_exec" {
-        return call.args["code"].as_str().unwrap_or("").to_string();
     }
     call.args.to_string()
 }

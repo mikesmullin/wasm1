@@ -1,457 +1,279 @@
-# PRD: `shell.run()` — Sandboxed Shell Execution for the Wasm Agent
+# SHELL.md: `shell_execute` Runtime Contract
 
-**Version** — 1.0
-**Date** — February 2026
-**Status** — Draft
+Version: 2.0
+Status: Current implementation
+Scope: Host shell emulator + template policy + session exec mode
 
 ---
 
 ## 1. Overview
 
-This document describes the design for allowing the AI agent to execute shell commands in a controlled, allow-listed manner from within the Boa JS interpreter running inside the Wasm guest.
+`wasm1` no longer executes JavaScript shell APIs (`shell.run`, `child_process`, or Boa-backed shell wrappers).
 
-The design has two interlocking parts:
+Shell execution is now handled by a host-side tool named `shell_execute` that accepts one command string:
 
-1. **`child_process` mock** — Any attempt by the LLM to use Node-style `child_process.*` APIs is intercepted and returns an AI-readable policy error, nudging the model toward the approved API.
-2. **`shell.run(cmd, args)` host function** — The approved shell execution API. Commands are validated against a per-agent regexp allow-list defined in a YAML template. Output is written to the virtual `.tcow` filesystem as a **JSON file** (`.out.json`); the agent retrieves results by reading that file path with `fs.readFile()` and parsing with `JSON.parse()`.
+- Tool name: `shell_execute`
+- Input schema: `{ "command": "..." }`
+- Execution model: parse -> policy check -> execute in constrained emulator
 
----
+The same emulator can also be invoked directly from CLI without adding chat history:
 
-## 2. CLI Change: `-t <template>` Flag
-
-The host binary (`cargo run`) gains a new flag:
-
-```
-cargo run -- -t solo "your prompt here"
-cargo run -- -t /absolute/path/to/my.yaml "your prompt here"
-```
-
-| Flag | Type | Default | Description |
-|---|---|---|---|
-| `-t`, `--template` | basename or absolute path | *(none — shell features disabled)* | Agent template to load. |
-
-### Template resolution
-
-If the value is an **absolute path**, it is used directly. Otherwise the value is treated as a **basename** (with or without `.yaml` extension) and the following `INCLUDE_PATH` is searched in order, stopping at the first match:
-
-1. `.agent/templates/<basename>.yaml` — project-local templates
-2. `~/.config/daemon/agent/templates/<basename>.yaml` — user-global templates
-
-If no file is found the process exits with an error.
-
-The template must be valid `daemon/v1` format as specified in `docs/TEMPLATE.md`. The template is loaded and parsed by the host at startup before the Wasm module is instantiated. The `metadata.shell.allow` list from the template is compiled into `Vec<regex::Regex>` and stored in `HostState`.
+- `wasm1 -s <session_id> exec "<command>"`
 
 ---
 
-## 3. Template Format
+## 2. Command Surface
 
-Templates must be valid `daemon/v1` format as specified in `docs/TEMPLATE.md`. wasm1 reads the standard fields (`metadata.description`, `metadata.model`, `spec.system_prompt`, etc.) and additionally reads the `metadata.shell` extension key, which is a wasm1-specific runtime-behavior config:
+### 2.1 Tool call shape
+
+The assistant must call:
+
+```json
+{"command":"skills"}
+```
+
+through tool `shell_execute`.
+
+### 2.2 CLI exec shape
+
+```bash
+wasm1 -s 1774737544123-248543-3ad5 exec "skills"
+wasm1 -s 1774737544123-248543-3ad5 exec "echo hello > out.txt"
+```
+
+`exec` uses the session `.tcow` filesystem and current shell metadata, then updates `metadata.cwd` in the session YAML.
+
+---
+
+## 3. Policy and Template Configuration
+
+Shell policy is configured in templates and compiled by the host at load time.
+
+### 3.1 Location and merge behavior
+
+Allow-list regexes come from both:
+
+1. `metadata.shell.allow` (legacy/global shell policy)
+2. Inline tool policy under `metadata.tools` for `shell_execute`
+
+Both sources are merged into one allow-list (`OR` behavior).
+
+### 3.2 Current preferred template style
 
 ```yaml
 apiVersion: daemon/v1
 kind: Agent
 metadata:
-  description: Solo task runner
-  model: xai:grok-4-fast-reasoning
-
-  # wasm1 extension — shell execution policy
-  shell:
-    # Ordered list of regexp patterns. First match wins.
-    # Matched against the full command string: "cmd arg1 arg2 ..."
-    allow:
-      - '^echo\b'
-      - '^ls\b'
-      - '^cat\s+[^/]'           # cat only relative paths
-      - '^git\s+(status|log|diff)\b'
-      - '^cargo\s+(build|test|check)\b'
-    # If no allow entry matches, the command is rejected.
-
+  tools:
+    - shell_execute:
+        allow:
+          - '^skills'
+          - '^echo'
+          - '^cat'
+          - '^ls'
+          - '^pwd$'
+          - '^cd($|\s)'
+        auto_approve:
+          - '^skills($|\s)'
+          - '^echo($|\s)'
+          - '^cat($|\s)'
+          - '^ls($|\s)'
+          - '^pwd$'
+          - '^cd($|\s)'
 spec:
   system_prompt: |
-    You are a general-purpose shell agent. Use shell.run() for system tasks.
+    Use shell_execute with {"command":"..."}.
 ```
 
-`metadata.shell` is placed under `metadata` rather than `spec` because it is runtime/behavior configuration (consistent with `metadata.tools`, `metadata.heartbeat`, etc. in the `daemon/v1` schema), not prompt content.
+Notes:
 
-### `metadata.shell` schema
-
-| Field | Type | Required | Description |
-|---|---|---:|---|
-| `allow` | `string[]` | no | Ordered list of regexp patterns. Matched against `"cmd arg1 arg2 ..."` (space-joined). First match permits the command. If the list is absent or empty, **all commands are denied**. |
+- `tools` entries may be simple strings (enable only) or single-key mappings with config.
+- Inline `allow` must be a list of regex strings.
+- Inline `auto_approve` must be a list of regex strings.
+- If no allow regex matches, execution is rejected before running.
 
 ---
 
-## 4. `child_process` Policy Mock (Boa-level)
+## 4. Shell Emulator Behavior
 
-Before user code runs inside `run_js_in_boa()`, a `child_process` module shim is injected into the Boa context. Every callable on it (`exec`, `execSync`, `spawn`, `spawnSync`, `execFile`, `fork`) is a native function that:
+## 4.1 Parsing model
 
-1. Writes to host stderr via `host_log` (prefixed `[STDERR]`):
+Input is parsed as one simple command with optional quoting and optional single `>` redirection.
 
-   ```
-   AI Policy Error: Use of child_process.exec() is prohibited for security reasons.
-   Please use require('shell').run(cmd, args) which returns a string path to a JSON
-   file in the virtual filesystem containing { exit_code, stdout, stderr }.
-   ```
+Supported:
 
-2. Throws a JS `Error` so execution stops and the error surfaces in the `JsExecResult.error` field, which the agent loop feeds back to the LLM.
+- Whitespace tokenization
+- Single quotes and double quotes
+- Backslash escaping (outside single quotes)
+- One trailing `>` redirection target
 
-A top-level `require('child_process')` call is intercepted by the guest-side `require()` implementation: if the resolved path is the literal string `child_process` (no file in `.tcow` by that name), the policy error is thrown before any file lookup.
+Semicolons are sanitized into spaces before parsing.
 
+## 4.2 Unsupported syntax (returns policy guidance)
+
+The emulator rejects advanced shell syntax with explicit messages:
+
+- Subshell: `$()`
+- Logical chaining: `&&`
+- Pipes: `|`
+- Heredoc: `<<`
+- Append redirect: `>>`
+- Backticks: `` `...` ``
+- Variable export: `export VAR=...`
+- Variable substitution: `$VAR`
+- Background execution: `&`
+
+Typical response prefix:
+
+- `Policy Error: ...` for parser-level policy guidance
+- `AI Policy Error: shell_execute command not in allow-list: "<program>". Check template metadata.shell.allow.` for allow-list denial
+
+## 4.3 Built-in commands
+
+The emulator implements these built-ins directly:
+
+- `pwd`
+- `cd [path]`
+- `echo ...`
+- `cat <file-or-glob>`
+- `ls [dir-or-glob]`
+
+Behavior details:
+
+- `pwd` prints current shell directory plus newline.
+- `cd` accepts zero or one arg; zero means `/`.
+- `cat` requires exactly one file/glob argument.
+- `ls` accepts zero or one argument.
+- `cat`/`ls` support `*` and `?` glob matching.
+
+## 4.4 External commands
+
+If command is not one of the built-ins, host spawns it via `std::process::Command`.
+
+- stdout and stderr are combined into one returned string
+- optional timeout enforced by template (`metadata.shell.timeout_secs`)
+- timeout returns text: `shell emulator timeout: command exceeded <N>s`
+
+## 4.5 Redirection
+
+Single output redirection is supported:
+
+```bash
+echo hello > out.txt
 ```
-agent sees error: "AI Policy Error: Use of child_process.exec() is prohibited..."
-  → LLM re-plans using shell.run()
-```
+
+The redirected content is written into session pending writes and then flushed into session `.tcow`.
+
+Restrictions:
+
+- only one `>`
+- redirection target must be present
+- no extra tokens after target
 
 ---
 
-## 5. `shell.run()`, `shell.stdin()`, and `shell.kill()` — The Approved APIs
+## 5. Working Directory Semantics
 
-### 5.1 JS surface (Boa)
+Each session tracks shell directory in metadata:
 
-```js
-// Both forms work:
-const p = shell.run(cmd, args);   // returns a Promise<string>
-const p = require('shell').run(cmd, args);
-```
+- `metadata.cwd`: current shell directory (persisted)
+- `metadata.workdir`: optional initial directory preference
 
-- `cmd` — executable name or path (e.g. `"git"`)
-- `args` — array of string arguments; optional, defaults to `[]`
-- **Returns a `Promise<string>`** that resolves to the `.out.json` file path when the child process exits.
+Resolution order at run/exec start:
 
-Because Boa does not have a native async runtime, the Promise is a lightweight shim object with one method: `.then(fn)`. The `.then` callback is called synchronously (the host blocks on process completion before returning). The Promise shape is provided for forwards compatibility and ergonomic familiarity:
+1. `metadata.cwd` if present/non-empty
+2. else `metadata.workdir` if present/non-empty
+3. else `/`
 
-```js
-// Awaiting (blocks until process exits):
-const outPath = await shell.run('git', ['status', '--short']);
-const result = fs.readFile(outPath);
-console.log(result);
-```
+Path behavior:
 
-**The `.out.json` file is written to the virtual FS immediately** when `shell.run()` is called — before the process exits — with `status: "running"`. This allows the agent to skip `await` and poll the file repeatedly for interactive workflows:
+- relative paths resolve from current cwd
+- absolute paths start at `/`
+- `.` and `..` are normalized
+- directory existence for `cd` is determined from union view of existing `.tcow` data and pending writes
 
-```js
-// Non-awaiting / polling pattern:
-const outPath = shell.run('some-interactive-cmd', []).path;  // .path available immediately
-// ... do other work ...
-let out;
-do {
-  out = JSON.parse(fs.readFile(outPath));
-} while (out.status === 'running');
-console.log('done:', out);
-```
-
-#### `shell.stdin(pid, sendkeys)`
-
-Sends a string to the stdin of a running child process. Useful for answering interactive prompts:
-
-```js
-const outPath = shell.run('some-tool', ['--interactive']).path;
-shell.stdin(pid, 'Y\n');   // answer a y/n prompt
-// poll outPath until state: ended
-```
-
-- `pid` — the integer PID from the `.out.json` file's `pid` field
-- `sendkeys` — string to write to the process's stdin (raw bytes; use `\n` for Enter)
-- Returns `undefined`; throws if PID is not a child of the current agent session or is already ended.
-
-> **Session-scoped:** `shell.stdin` (and `shell.kill` below) only accept PIDs that were created by `shell.run` in the current session. Arbitrary host PIDs are rejected with a JS error.
-
-#### `shell.kill(pid, [signal])`
-
-Sends a signal to a running child process, terminating or interrupting it:
-
-```js
-const outPath = shell.run('some-long-running-cmd', []).path;
-// ... decide it's no longer needed
-shell.kill(pid);          // default: SIGTERM
-shell.kill(pid, 'SIGKILL');  // forceful kill
-shell.kill(pid, 'SIGINT');   // Ctrl-C equivalent
-```
-
-- `pid` — the integer PID from the `.out.json` file's `pid` field
-- `signal` — optional signal name string; one of `SIGTERM` (default), `SIGKILL`, `SIGINT`, `SIGHUP`
-- Returns `undefined` on success; throws if PID is not a session child, is already ended, or signal name is unrecognised.
-- After a successful kill the `.out.json` file is updated with `status: "killed"` and the actual exit code.
-
-### 5.2 Allow-list check (host-side)
-
-When the guest calls the `shell_run` host function, the host:
-
-1. Reconstructs the full command string: `format!("{cmd} {joined_args}")` (space-joined).
-2. Iterates the `metadata.shell.allow` regexp list from the loaded template in order.
-3. If **no** pattern matches → rejects with a JS error containing the policy message; does **not** execute anything.
-4. If a pattern matches → proceeds to execution.
-
-Matching uses Rust's `regex` crate, case-sensitive, against the full `"cmd arg1 arg2 ..."` string.
-
-### 5.3 Host execution
-
-On allow-list pass:
-
-1. Generates the output filename **before spawning**: `/tmp/{unix_time_ms}_{6_char_sha1}.out.json`
-   - `unix_time_ms` — `SystemTime::now()` milliseconds since epoch
-   - `6_char_sha1` — first 6 hex chars of `sha1("{cmd} {args} {unix_time_ms}")`
-2. Writes an **initial JSON snapshot** to `pending_writes` immediately (status `running`):
-
-```json
-{
-  "pid": 12345,
-  "status": "running",
-  "cmd": "some-interactive-cmd",
-  "args": [],
-  "started_ms": 1709123456789,
-  "stdout": "",
-  "stderr": "",
-  "exit_code": null,
-  "elapsed_ms": null
-}
-```
-
-3. Spawns the process via `std::process::Command` with `stdout(Stdio::piped())` and `stderr(Stdio::piped())`.
-4. Stores the `Child` handle in `HostState::running_processes: HashMap<u32, Child>` keyed by PID.
-5. Waits for the process to exit (blocking, up to `shell_timeout`), reading stdout/stderr as it completes.
-6. Updates the `.out.json` entry in `pending_writes` with the final JSON:
-
-```json
-{
-  "pid": 12345,
-  "status": "ended",
-  "cmd": "git",
-  "args": ["status", "--short"],
-  "started_ms": 1709123456789,
-  "exit_code": 0,
-  "stdout": "M src/main.rs\n",
-  "stderr": "",
-  "elapsed_ms": 124
-}
-```
-
-7. Removes the PID from `running_processes`.
-8. Returns the `.out.json` path string to the guest.
+After each `exec`, resolved cwd is written back to `metadata.cwd`.
 
 ---
 
-## 6. Architecture Diagram
+## 6. Session and Filesystem Effects
 
-```
-  Boa JS context (inside Wasm guest)
-  ├── console.log               (captured stdout)
-  ├── fs.readFile(path)         (reads from .tcow)
-  ├── fs.writeFile(p, d)        (writes to .tcow)
-  ├── fs.readdir(dir)           (lists .tcow)
-  ├── require(path)             (evals .tcow JS module)
-  │     ├── 'child_process'  → policy error mock (no execution)
-  │     └── 'shell'          → returns shell object (same as global)
-  ├── shell.run(cmd, args)   ──────────────────────────────────────────┐
-  │                                                       host fn:      │
-  │                                                       shell_run     ▼
-  │                                                   ┌────────────────────────────────┐
-  │                                                   │ 1. allow-list regexp check     │
-  │                                                   │    (metadata.shell.allow)      │
-  │                                                   │ 2. write initial .out.json (running)│
-  │                                                   │ 3. spawn child process         │
-  │                                                   │ 4. store Child in HashMap<pid> │
-  │                                                   │ 5. wait + capture output       │
-  │                                                   │ 6. update .out.json (ended)    │
-  │                                                   │ 7. return .out.json path       │
-  │                                                   └────────────────────────────────┘
-  │                                                               │
-  ├── shell.stdin(pid, keys)  ────────────────────────────────────┼──────┐
-  │                                                   host fn:     │      │
-  │                                                   shell_stdin  ▼      ▼
-  │                                                ┌────────────────────────────────┐
-  │                                                │ validate pid ∈ running_processes│
-  │                                                │ write keys to child stdin       │
-  │                                                └────────────────────────────────┘
-  │
-  └── shell.kill(pid, signal)  ───────────────────────────────────────────┐
-                                                              host fn:     │
-                                                              shell_kill   ▼
-                                                   ┌────────────────────────────────┐
-                                                   │ validate pid ∈ running_processes│
-                                                   │ send signal to child process    │
-                                                   │ update .out.json  status: killed│
-                                                   └────────────────────────────────┘
-                                                               │
-                                                      agent.tcow  (/tmp/*.out.json)
-```
+## 6.1 Tool path (`shell_execute`)
+
+- Runs inside normal agent loop.
+- Tool result is returned to model and can be persisted in session message history.
+- Any writes (including redirection output) are flushed into:
+  - `.agent/fs/<session_id>.tcow`
+
+## 6.2 CLI path (`-s <id> exec`)
+
+- Runs one shell command in same emulator.
+- Uses same `.tcow` and cwd/workdir metadata.
+- Does not append user/assistant/tool messages to `spec.messages`.
+- Persists `metadata.cwd` and any file writes.
+
+Output newline behavior:
+
+- if output already ends with newline, print as-is
+- otherwise append newline for clean terminal rendering
 
 ---
 
-## 7. Host Changes
+## 7. Verbosity Interaction
 
-### 7.1 `HostState` additions
+Global CLI verbosity controls display style, not shell semantics:
 
-```rust
-struct HostState {
-    // ... existing fields ...
+- default: final assistant response only
+- `-v`: user/assistant/tool event summary
+- `-vv`: full host/guest diagnostics
+- `-q`: suppress stdout (errors still on stderr)
 
-    /// Compiled allow-list from template metadata.shell.allow.
-    /// Empty vec = all shell commands denied.
-    shell_allow: Vec<regex::Regex>,
-
-    /// Wall-clock timeout for shell commands in seconds.
-    shell_timeout_secs: u64,  // default: 30
-
-    /// Live child processes spawned this session, keyed by PID.
-    /// Cleared when process exits; consulted by shell_stdin.
-    running_processes: HashMap<u32, std::process::Child>,
-}
-```
-
-### 7.2 New host functions
-
-#### `shell_run`
-
-Registered as `"host"` / `"shell_run"`:
-
-```rust
-linker.func_wrap("host", "shell_run",
-    |mut caller: Caller<'_, HostState>,
-     cmd_ptr: i32, cmd_len: i32,      // UTF-8 command name
-     args_ptr: i32, args_len: i32,    // JSON array of string args
-     out_ptr: i32, out_cap: i32|      // output buffer receives .out path
-     -> i32 { ... })?;
-```
-
-Args are passed as a JSON array string (`["status","--short"]`) to avoid a variadic ABI.
-
-Return value: byte count of path written, or negative error sentinel.
-
-#### `shell_stdin`
-
-Registered as `"host"` / `"shell_stdin"`:
-
-```rust
-linker.func_wrap("host", "shell_stdin",
-    |mut caller: Caller<'_, HostState>,
-     pid: i32,                         // PID of running child
-     keys_ptr: i32, keys_len: i32|     // raw bytes to write to child stdin
-     -> i32 { ... })?;  // 0 on success, negative on error
-```
-
-Error codes: `-1` PID not found / already ended, `-2` write failed, `-3` not a child of this session.
-
-#### `shell_kill`
-
-Registered as `"host"` / `"shell_kill"`:
-
-```rust
-linker.func_wrap("host", "shell_kill",
-    |mut caller: Caller<'_, HostState>,
-     pid:        i32,
-     sig_ptr:    i32, sig_len: i32|   // signal name UTF-8 string; empty = "SIGTERM"
-     -> i32 { ... })?;  // 0 on success, negative on error
-```
-
-Accepted signal names: `SIGTERM`, `SIGKILL`, `SIGINT`, `SIGHUP`. Any other value returns `-4` (invalid signal). Uses `libc::kill` on Unix.
-
-Error codes: `-1` PID not found / already ended, `-2` kill syscall failed, `-3` not a child of this session, `-4` invalid signal name.
-
-After a successful kill, the `.out.json` entry in `pending_writes` is updated: `status: "killed"`, `exit_code` set to the actual exit code collected by a non-blocking `waitpid`.
-
-### 7.3 New Cargo dependencies
-
-```toml
-regex      = "1"
-serde_yaml = "0.9"
-sha1       = "0.10"
-```
+These flags apply to normal runs. `exec` respects quiet mode by suppressing printed output when `-q` is set.
 
 ---
 
-## 8. Guest Changes
+## 8. Help Text Contract
 
-### 8.1 New host imports
+`wasm1` with no args and `wasm1 --help` both print the same expanded help text.
 
-```rust
-#[link(wasm_import_module = "host")]
-unsafe extern "C" {
-    // ... existing imports ...
+Shell-relevant command listed there:
 
-    fn shell_run(
-        cmd_ptr:  i32, cmd_len:  i32,   // command name
-        args_ptr: i32, args_len: i32,   // JSON string array
-        out_ptr:  i32, out_cap:  i32,   // receives .out path
-    ) -> i32;  // bytes written, or negative error
+- `-s <session_id> exec <command>`
 
-    fn shell_stdin(
-        pid:       i32,
-        keys_ptr:  i32, keys_len: i32,  // raw bytes to send
-    ) -> i32;  // 0 on success, negative error
-
-    fn shell_kill(
-        pid:     i32,
-        sig_ptr: i32, sig_len: i32,     // signal name (empty = SIGTERM)
-    ) -> i32;  // 0 on success, negative error
-}
-```
-
-### 8.2 Boa injections in `run_js_in_boa()`
-
-```
-child_process  (mock object — always throws)
-  .exec / .execSync / .spawn / .spawnSync / .execFile / .fork
-  → NativeFunction throws JS Error with AI policy message
-
-shell  (real object)
-  .run(cmd, args)
-      → calls shell_run host fn
-      → immediately returns a Promise-shim:
-           { path: "/tmp/...", then: fn(cb) { cb(path) } }
-         (the host has already waited for process exit before returning,
-          so .then is synchronous; await works naturally in Boa)
-  .stdin(pid, sendkeys)
-      → calls shell_stdin host fn
-      → validates pid ∈ session running_processes; throws otherwise
-      → returns undefined
-  .kill(pid, signal?)
-      → calls shell_kill host fn
-      → validates pid ∈ session running_processes; throws otherwise
-      → updates .out state to 'killed'
-      → returns undefined
-
-require('child_process')  → same policy error as mock methods above
-require('shell')          → returns the shell object (same reference as global)
-```
+with explicit note that it uses session shell context and metadata cwd/workdir.
 
 ---
 
-## 9. Security Properties
+## 9. Error Message Expectations
 
-| Property | Mechanism |
-|---|---|
-| LLM cannot escape the allow-list | `metadata.shell.allow` is compiled into host `HostState`; guest has no access to it |
-| LLM cannot bypass via `child_process` | Mock throws before any syscall; no real `child_process` binding exists in Boa |
-| LLM cannot send stdin to arbitrary PIDs | `shell_stdin` validates PID against `running_processes` — only PIDs created by `shell.run` in this session |
-| LLM cannot kill arbitrary host processes | `shell_kill` validates PID against the same session-scoped `running_processes` map before issuing any signal |
-| LLM cannot read arbitrary host files | `fs.*` only reads from `.tcow` virtual FS |
-| Command output is auditable | Every `/tmp/*.out.json` file is flushed to `agent.tcow`; full history is permanently queryable via `tcow cat` |
-| Timeout limits runaway commands | `shell_timeout_secs` hard-kills the child and sets `status: "timeout"` in the `.out.json` file |
-| No ambient WASI authority | Unchanged — guest still has no direct WASI fs/net access |
+The runtime emits concise, user-guiding shell errors.
+
+Common forms:
+
+- `shell emulator error: ...` for malformed/simple usage errors
+- `Policy Error: ...` for unsupported shell constructs
+- `AI Policy Error: shell_execute command not in allow-list: ...` for template denial
+
+This split is intentional:
+
+- parser/usability issues are recoverable command edits
+- policy issues communicate capability boundaries
+- allow-list denial points to template configuration
 
 ---
 
-## 10. Testing Plan
+## 10. Migration Notes from Old Design
 
-| Scenario | Expected result |
-|---|---|
-| Agent uses `child_process.exec()` | Policy error thrown; LLM receives error and re-plans |
-| Agent uses `require('child_process')` | Same policy error via `require` intercept |
-| `shell.run('echo', ['hello'])` with `^echo\b` in allow-list | Returns Promise; `.out.json` has `status: "ended"`, `exit_code: 0`, `stdout: "hello\n"` |
-| `shell.run('rm', ['-rf', '/'])` with no matching allow entry | Host rejects before spawn; JS error surfaced to LLM |
-| `-t` given a basename; file exists in `.agent/templates/` | Resolved and loaded; INCLUDE_PATH search used |
-| `-t` given an absolute path | File loaded directly, no search |
-| `-t` basename not found in any INCLUDE_PATH dir | Process exits with clear error |
-| Command times out (> `shell_timeout_secs`) | Child killed; `.out.json` has `status: "timeout"`, `exit_code: -1` |
-| Agent polls `.out.json` while process is running | `status: "running"` returned; updates to `status: "ended"` after process exits |
-| `shell.stdin(pid, 'Y\n')` to a running process | Bytes written to child stdin; next `fs.readFile(outPath)` reflects new stdout |
-| `shell.stdin(pid, ...)` with dead or foreign PID | Returns `-1`; JS throws |
-| `shell.kill(pid)` (SIGTERM) on a running process | Child receives SIGTERM; `.out.json` updated to `status: "killed"` |
-| `shell.kill(pid, 'SIGKILL')` on a running process | Child forcefully terminated; `.out.json` updated to `status: "killed"` |
-| `shell.kill(pid, 'SIGINT')` on a running process | Child receives SIGINT (Ctrl-C); `.out.json` updated to `status: "killed"` |
-| `shell.kill(pid, ...)` with dead or foreign PID | Returns `-1`; JS throws |
-| `shell.kill(pid, 'SIGXXX')` with invalid signal | Returns `-4`; JS throws |
-| Agent reads output path with `fs.readFile()` | Returns JSON string from `.tcow /tmp/*.out.json` entry |
-| `tcow ls agent.tcow` after shell command | `/tmp/*.out.json` file(s) visible in union view |
-| Across agent restarts, old `/tmp/*.out.json` still readable | `.tcow` persistence via delta layers |
+Removed from runtime:
+
+- Boa-based shell APIs
+- `shell.run`, `shell.stdin`, `shell.kill`
+- `child_process` policy shim model
+- `.out.json` process-state files as primary shell contract
+
+Current architecture is tool-native:
+
+- one command string through `shell_execute`
+- constrained parser + built-ins + optional host external spawn
+- policy gating via template regex allow-list
+- session metadata-backed cwd continuity
